@@ -2422,9 +2422,16 @@ async def cb_create_account_start(callback: types.CallbackQuery, state: FSMConte
 
 @dp.message(AccountCreationStates.waiting_for_username)
 async def process_account_username(message: types.Message, state: FSMContext):
-    # منع قبول الأوامر أو أزرار القائمة أثناء انتظار اسم المستخدم
+    # إذا أرسل المستخدم أي أمر يبدأ بـ / في أي وقت، قم بإلغاء الحالة وتنفيذ الأمر فوراً
     if message.text and message.text.startswith("/"):
-        await message.answer("❌ لا يمكنك استخدام الأوامر أثناء عملية إنشاء الحساب.\n\nيرجى كتابة اسم المستخدم المطلوب (أحرف إنجليزية وأرقام، وبدون مسافات أو رموز):")
+        await state.clear()  # إلغاء الحالة الحالية تماماً
+        
+        if message.text.startswith("/start"):
+            await cmd_start(message, state)
+        elif message.text.startswith("/admin"):
+            await cmd_admin_panel(message, state)
+        else:
+            await message.answer("🔄 تم إلغاء العملية السابقة بناءً على طلبك.")
         return
 
     username_input = message.text.strip() if message.text else ""
@@ -2446,18 +2453,6 @@ async def process_account_username(message: types.Message, state: FSMContext):
         "🔑 أدخل كلمة مرور مناسبة (أحرف إنجليزية وأرقام، بدون رموز):",
         reply_markup=markup
     )
-    if not message.text:
-        await message.answer("❌ يرجى إدخال اسم مستخدم كـ نص:")
-        return
-    text = message.text.strip()
-    
-    if not re.match(r"^[A-Za-z0-9]{8,}$", text):
-        await message.answer("❌ اسم المستخدم غير صالح!\nيجب أن يكون من 8 أحرف إنجليزية وأرقام على الأقل وبدون أي رموز أو مسافات. حاول مجدداً:")
-        return
-
-    await state.update_data(acc_username=text)
-    await state.set_state(AccountCreationStates.waiting_for_password)
-    await message.answer("🔑 أدخل كلمة مرور مناسبة (أحرف إنجليزية وأرقام، بدون رموز):")
 
 
 @dp.message(AccountCreationStates.waiting_for_password)
