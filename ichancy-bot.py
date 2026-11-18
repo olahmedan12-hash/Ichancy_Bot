@@ -2422,6 +2422,30 @@ async def cb_create_account_start(callback: types.CallbackQuery, state: FSMConte
 
 @dp.message(AccountCreationStates.waiting_for_username)
 async def process_account_username(message: types.Message, state: FSMContext):
+    # منع قبول الأوامر أو أزرار القائمة أثناء انتظار اسم المستخدم
+    if message.text and message.text.startswith("/"):
+        await message.answer("❌ لا يمكنك استخدام الأوامر أثناء عملية إنشاء الحساب.\n\nيرجى كتابة اسم المستخدم المطلوب (أحرف إنجليزية وأرقام، وبدون مسافات أو رموز):")
+        return
+
+    username_input = message.text.strip() if message.text else ""
+
+    # التحقق من أن اسم المستخدم يتكون من 8 أحرف إنجليزية وأرقام على الأقل بدون رموز
+    if not re.match(r"^[A-Za-z0-9]{8,}$", username_input):
+        await message.answer(
+            "❌ اسم المستخدم غير صالح!\n"
+            "يجب أن يكون من 8 أحرف إنجليزية وأرقام على الأقل وبدون أي رموز أو مسافات. حاول مجدداً:"
+        )
+        return
+
+    # حفظ الاسم والانتقال لحالة كلمة المرور
+    await state.update_data(acc_username=username_input)
+    await state.set_state(AccountCreationStates.waiting_for_password)
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 إلغاء", callback_data="main_menu")]])
+    await message.answer(
+        "🔑 أدخل كلمة مرور مناسبة (أحرف إنجليزية وأرقام، بدون رموز):",
+        reply_markup=markup
+    )
     if not message.text:
         await message.answer("❌ يرجى إدخال اسم مستخدم كـ نص:")
         return
