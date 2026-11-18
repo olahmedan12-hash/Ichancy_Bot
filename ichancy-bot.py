@@ -24,7 +24,18 @@ DEFAULT_SHAM_USD_QR = "sham_usd_qr.jpg"
 # تعريف البوت والـ Dispatcher
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=None))
 dp = Dispatcher()
-
+# معالج عام لأي أمر يبدأ بـ / لضمان تنفيذه في أي وقت وفي أي مكان بالبوت فوراً
+@dp.message(F.text.startswith("/"))
+async def global_commands_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    text = message.text.strip()
+    
+    if text.startswith("/start"):
+        await cmd_start(message, state)
+    elif text.startswith("/admin"):
+        await cmd_admin_panel(message, state)
+    else:
+        await message.answer("🔄 تم إلغاء العملية الحالية وتنفيذ الأمر المطلوب.")
 # حالات التفاعل (FSM States)
 class AccountCreationStates(StatesGroup):
     waiting_for_username = State()
