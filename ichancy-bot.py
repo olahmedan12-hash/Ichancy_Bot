@@ -1,2798 +1,3599 @@
-import asyncio
-import logging
 import os
 import re
-from datetime import datetime, date
-import aiosqlite
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
-from aiogram.client.default import DefaultBotProperties
-from aiogram.types import BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BotCommandScopeChat
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
+import sqlite3
+from datetime import datetime
+import telebot
+from telebot.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    MenuButtonCommands,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove,
+)
 
-# === الإعدادات الأساسية والثوابت ===
-TOKEN = "8465308599:AAGCNbkydQq8dztMUl-CBTCvSiC53D_vmMs"
-DB_NAME = "ichancy_advanced_bot_v27.db"
-ADMIN_ID = 8562347616  # آيدي المسؤول الأساسي
+# قراءة الإعدادات من متغيرات البيئة مع قيم افتراضية للاختبار المحلي
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9038004780:AAG5HYm4at5yOq8VIVnbB8gaLU0OJE5C9Hk")
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+DEFAULT_CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/ichancyadam")
+DEFAULT_CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@ichancyadam")
 
-# مسارات الصور الافتراضية لوسائل الشحن
-DEFAULT_SYRITEL_QR = "syr_qr.jpg"
-DEFAULT_SHAM_SYP_QR = "sham_syp_qr.jpg"
-DEFAULT_SHAM_USD_QR = "sham_usd_qr.jpg"
+# تعيين المشرف الجديد والرئيسي الوحيد Ola276 وإلغاء المشرف القديم
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Ola276").lstrip("@").strip()
+ENV_ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-# تعريف البوت والـ Dispatcher
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=None))
-dp = Dispatcher()
-# معالج عام لأي أمر يبدأ بـ / لضمان تنفيذه في أي وقت وفي أي مكان بالبوت فوراً
-@dp.message(F.text.startswith("/"))
-async def global_commands_handler(message: types.Message, state: FSMContext):
-    await state.clear()
-    text = message.text.strip()
-    
-    if text.startswith("/start"):
-        await cmd_start(message, state)
-    elif text.startswith("/admin"):
-        await cmd_admin_panel(message, state)
-    else:
-        await message.answer("🔄 تم إلغاء العملية الحالية وتنفيذ الأمر المطلوب.")
-# حالات التفاعل (FSM States)
-class AccountCreationStates(StatesGroup):
-    waiting_for_username = State()
-    waiting_for_password = State()
+# إعدادات طرق الشحن الافتراضية
+DEFAULT_SYRIATEL_CODE = os.getenv("SYRIATEL_CODE", "0933380467")
+MIN_SYRIATEL_AMOUNT = 200.0
 
-class AdminEditStates(StatesGroup):
-    editing_username = State()
-    editing_password = State()
+DEFAULT_SHAM_CASH_SYP_CODE = os.getenv(
+    "SHAM_CASH_SYP_CODE",
+    "658544223c0e72faa9776f6a22cbfeba",
+)
+MIN_SHAM_CASH_SYP_AMOUNT = 200.0
 
-class BotSyritelDepositStates(StatesGroup):
-    waiting_for_trx_id = State()
-    waiting_for_amount = State()
+DEFAULT_SHAM_CASH_USD_CODE = os.getenv(
+    "SHAM_CASH_USD_CODE",
+    "658544223c0e72faa9776f6a22cbfeba",
+)
+DEFAULT_SHAM_CASH_USD_RATE_SYP = 142.0
 
-class BotShamSypDepositStates(StatesGroup):
-    waiting_for_trx_id = State()
-    waiting_for_amount = State()
+# إعدادات سحب الرصيد من البوت الافتراضية
+MIN_WITHDRAW_SYRIATEL = 250.0
+MAX_WITHDRAW_SYRIATEL = 5000000.0
+MIN_WITHDRAW_SHAM_CASH = 2000.0
+DEFAULT_WITHDRAW_COMMISSION_RATE = 0.10
+DEFAULT_WITHDRAW_USD_RATE_SYP = 145.0
 
-class BotShamUsdDepositStates(StatesGroup):
-    waiting_for_trx_id = State()
-    waiting_for_amount = State()
+# إعدادات شحن وسحب رصيد الحساب في المنصة
+MIN_ACCOUNT_DEPOSIT = 200.0
+MIN_ACCOUNT_WITHDRAW = 200.0
 
-class BotWithdrawStates(StatesGroup):
-    waiting_for_amount = State()
-    waiting_for_details = State()
+# تعريف الأزرار القابلة لتخصيص الرسائل والصور
+CUSTOMIZABLE_BUTTONS: list[tuple[str, str]] = [
+    ("btn_ichancy", "⚡ichancy ⚡"),
+    ("btn_deposit_bot", "شحن رصيد الى البوت ⬇️"),
+    ("btn_withdraw_bot", "سحب رصيد من البوت ⬆️"),
+    ("btn_deposit_acc", "شحن رصيد في الحساب 🔽"),
+    ("btn_withdraw_acc", "سحب رصيد من الحساب 🔼"),
+    ("btn_logs", "السجلات 🗃️"),
+    ("btn_support", "التواصل مع الدعم 📩"),
+    ("btn_offers", "العروض الحاليه 🎁"),
+    ("btn_terms", "الشروط والاحكام 📝"),
+    ("btn_lottery", "الياناصيب الاسبوعي💵"),
+]
+BUTTON_KEY_TO_TITLE = dict(CUSTOMIZABLE_BUTTONS)
 
-class AccountDepositStates(StatesGroup):
-    waiting_for_amount = State()
+# شرط الاسم: 8 أحرف إنجليزية صغيرة على الأقل وأحرف فقط بدون رموز أو أرقام أو مسافات
+USERNAME_PATTERN = re.compile(r"^[a-z]{8,}$")
+# شرط الأرقام الإنجليزية فقط (صحيحة أو عشرية بنقطة إنجليزية)
+ENGLISH_NUMBER_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
 
-class AccountWithdrawStates(StatesGroup):
-    waiting_for_amount = State()
-
-class AdminBroadcastStates(StatesGroup):
-    waiting_for_content = State()
-
-class AdminWelcomeStates(StatesGroup):
-    waiting_for_text = State()
-
-class AdminOffersStates(StatesGroup):
-    waiting_for_text = State()
-
-class AdminBotNameStates(StatesGroup):
-    waiting_for_name = State()
-
-class AdminBotPhotoStates(StatesGroup):
-    waiting_for_photo = State()
-
-class AdminEditMsgStates(StatesGroup):
-    waiting_for_text = State()
-    waiting_for_photo = State()
-
-class AdminEditDepositPhotoStates(StatesGroup):
-    waiting_for_photo = State()
-
-class AdminEditWithdrawMsgStates(StatesGroup):
-    waiting_for_text = State()
-
-class AdminManageUserStates(StatesGroup):
-    waiting_for_user_id = State()
-    waiting_for_new_balance = State()
-
-class AdminDailyStatsStates(StatesGroup):
-    waiting_for_date = State()
-
-class SupportStates(StatesGroup):
-    waiting_for_message = State()
-
-class AdminAddSecondaryStates(StatesGroup):
-    waiting_for_admin_id = State()
-
-class AdminSearchOpStates(StatesGroup):
-    waiting_for_op_number = State()
-
-class AdminCommissionStates(StatesGroup):
-    waiting_for_commission_value = State()
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 
-# === تهيئة قاعدة البيانات والجداول ===
-async def init_database():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
+def get_connection() -> sqlite3.Connection:
+    """إنشاء اتصال بقاعدة بيانات SQLite."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """إنشاء الجداول المطلوبة في قاعدة البيانات إذا لم تكن موجودة."""
+    with get_connection() as conn:
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                referred_by INTEGER,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                first_name TEXT,
+                balance REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL
             )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS wallets (
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_states (
                 user_id INTEGER PRIMARY KEY,
-                balance REAL DEFAULT 0.0,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
+                state TEXT NOT NULL,
+                temp_data TEXT,
+                updated_at TEXT NOT NULL
             )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_agreements (
-                user_id INTEGER PRIMARY KEY,
-                agreed INTEGER DEFAULT 0
-            )
-        """)
-        await db.execute("""
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS ichancy_accounts (
                 user_id INTEGER PRIMARY KEY,
-                ichancy_username TEXT,
-                ichancy_password TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                acc_username TEXT NOT NULL,
+                acc_password TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS pending_acc_requests (
-                user_id INTEGER PRIMARY KEY,
-                acc_username TEXT,
-                acc_password TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS pending_bot_deposits (
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                method TEXT,
-                trx_id TEXT,
-                amount REAL
+                user_id INTEGER NOT NULL,
+                acc_username TEXT NOT NULL,
+                acc_password TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
             )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS pending_bot_withdraws (
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_deposit_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                method TEXT,
-                amount REAL,
-                commission REAL,
-                net_amount REAL,
-                details TEXT,
-                admin_msg_id INTEGER
+                user_id INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                amount REAL NOT NULL,
+                tx_number TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
             )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS pending_acc_deposits (
-                user_id INTEGER PRIMARY KEY,
-                amount REAL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS pending_acc_withdraws (
-                user_id INTEGER PRIMARY KEY,
-                amount REAL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS financial_logs (
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_withdraw_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                op_number INTEGER,
-                user_id INTEGER,
-                action_type TEXT,
-                amount REAL,
-                currency TEXT,
-                created_at DATE DEFAULT (date('now'))
+                user_id INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                amount REAL NOT NULL,
+                commission REAL NOT NULL,
+                net_amount REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
             )
-        """)
-        await db.execute("""
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_transfer_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                transfer_type TEXT NOT NULL,
+                acc_username TEXT NOT NULL,
+                amount REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                message_type TEXT NOT NULL,
+                content_text TEXT,
+                photo_file_id TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS button_configs (
+                button_key TEXT PRIMARY KEY,
+                custom_message TEXT,
+                photo_file_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
-                value TEXT
+                value TEXT NOT NULL
             )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS secondary_admins (
-                admin_id INTEGER PRIMARY KEY,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.commit()
-        
-        async with aiosqlite.connect(DB_NAME) as db_conn:
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('channel_username', '@ichancynor')")
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('bot_status', 'active')")
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('withdraw_commission', '0')")
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('admin_dispatch_index', '0')")
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('welcome_message', '🤖 البوت الأفضل معك\\n\\nقبل استخدام بوت ichancy، يرجى قراءة الشروط التالية:\\n\\n🔹 نطاق الخدمة: البوت مخصّص فقط لـ إنشاء الحسابات والتعبئة والسحب الفوري داخل منصة ichancy.')")
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('active_offers_message', '🎁 **العروض النشطة حالياً:**\\n\\nلا توجد عروض نشطة في الوقت الحالي. تابعنا دائماً ليصلك كل جديد!')")
-            
-            default_syritel = "قم بالتحويل الى أحد الارقام بطريقة التحويل اليدوي\n\n0933380467\n\nثم أدخل رقم العملية\n\nالحد الادنى للشحن: SYP 200.00\nيرجى الانتباه الى ان اي مبلغ اقل من الحد الادنى لن تتم معالجته ولا يمكن استرداده"
-            default_sham_syp = "658544223c0e72faa9776f6a22cbfeba\n\nالحد الادنى للشحن: SYP 200.00\nيرجى الانتباه الى ان اي مبلغ اقل من الحد الادنى لن تتم معالجته ولا يمكن استرداده"
-            default_sham_usd = "658544223c0e72faa9776f6a22cbfeba\n\nالحد الادنى للشحن: USD 1.00\nيرجى الانتباه الى ان اي مبلغ اقل من الحد الادنى لن تتم معالجته ولا يمكن استرداده"
-            
-            default_wit_syritel = "⬆️ سحب رصيد عبر (سيريتل كاش 🪙):\n\nأدخل معلومات حساب الاستلام ورقم الهاتف مع المبلغ المطلوب."
-            default_wit_sham_syp = "⬆️ سحب رصيد عبر (شام كاش سوري 💵):\n\nأدخل معلومات حساب الاستلام أو المعرف الخاص بك."
-            default_wit_sham_usd = "⬆️ سحب رصيد عبر (شام كاش دولار 💲):\n\nأدخل تفاصيل محفظة الدولار الخاصة بك."
-
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('msg_dep_syritel', ?)", (default_syritel,))
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('msg_dep_sham_syp', ?)", (default_sham_syp,))
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('msg_dep_sham_usd', ?)", (default_sham_usd,))
-            
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('msg_wit_syritel', ?)", (default_wit_syritel,))
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('msg_wit_sham_syp', ?)", (default_wit_sham_syp,))
-            await db_conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('msg_wit_sham_usd', ?)", (default_wit_sham_usd,))
-            await db_conn.commit()
-
-
-async def fetch_setting(key: str) -> str:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else ""
-
-
-async def is_admin(user_id: int) -> bool:
-    if user_id == ADMIN_ID:
-        return True
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT admin_id FROM secondary_admins WHERE admin_id = ?", (user_id,)) as cur:
-            return await cur.fetchone() is not None
-
-
-async def get_all_admins() -> list:
-    admins = [ADMIN_ID]
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT admin_id FROM secondary_admins") as cur:
-            rows = await cur.fetchall()
-            for r in rows:
-                admins.append(r[0])
-    return admins
-
-
-# === نظام توزيع الطلبات بالترتيب بين المشرفين (Round-Robin) ===
-async def notify_next_admin(text: str, reply_markup=None, photo=None):
-    admins = await get_all_admins()
-    if not admins:
-        return None
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT value FROM bot_settings WHERE key = 'admin_dispatch_index'") as cur:
-            row = await cur.fetchone()
-            current_idx = int(row[0]) if row else 0
-
-        if current_idx >= len(admins):
-            current_idx = 0
-
-        target_admin_id = admins[current_idx]
-
-        next_idx = (current_idx + 1) % len(admins)
-        await db.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('admin_dispatch_index', ?)", (str(next_idx),))
-        await db.commit()
-
-    try:
-        if photo:
-            sent_msg = await bot.send_photo(chat_id=target_admin_id, photo=photo, caption=text, reply_markup=reply_markup)
-        else:
-            sent_msg = await bot.send_message(chat_id=target_admin_id, text=text, reply_markup=reply_markup)
-        return target_admin_id, sent_msg
-    except Exception:
-        return target_admin_id, None
-
-
-async def log_financial(op_number: int, user_id: int, action_type: str, amount: float, currency: str = "SYP"):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO financial_logs (op_number, user_id, action_type, amount, currency) VALUES (?, ?, ?, ?, ?)",
-            (op_number, user_id, action_type, amount, currency)
+            """
         )
-        await db.commit()
+        if ENV_ADMIN_CHAT_ID.isdigit():
+            conn.execute(
+                """
+                INSERT INTO bot_settings (key, value)
+                VALUES ('ola276_chat_id', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (ENV_ADMIN_CHAT_ID,),
+            )
+        conn.commit()
 
 
-async def register_user_if_new(user_id: int, username: str, referred_by: int = None):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            if not await cursor.fetchone():
-                await db.execute(
-                    "INSERT INTO users (user_id, username, referred_by) VALUES (?, ?, ?)",
-                    (user_id, username, referred_by if referred_by != user_id else None)
-                )
-                await db.execute("INSERT INTO wallets (user_id, balance) VALUES (?, 0.0)", (user_id,))
-                await db.commit()
+def set_setting(key: str, value: str):
+    """حفظ قيمة إعداد في قاعدة البيانات."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
 
 
-async def get_user_balance(user_id: int) -> float:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT balance FROM wallets WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0.0
+def get_setting(key: str, default: str | None = None) -> str | None:
+    """قراءة قيمة إعداد من قاعدة البيانات."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row["value"] if row else default
 
 
-async def verify_subscription(bot_obj: Bot, user_id: int) -> bool:
-    channel = await fetch_setting("channel_username")
+def get_channel_username() -> str:
+    val = (get_setting("channel_username", DEFAULT_CHANNEL_USERNAME) or DEFAULT_CHANNEL_USERNAME).strip()
+    return val if val.startswith("@") else f"@{val}"
+
+
+def get_channel_url() -> str:
+    val = (get_setting("channel_url", DEFAULT_CHANNEL_URL) or DEFAULT_CHANNEL_URL).strip()
+    if val.startswith("http://") or val.startswith("https://"):
+        return val
+    clean_u = val.lstrip("@")
+    return f"https://t.me/{clean_u}"
+
+
+def get_syriatel_code() -> str:
+    return (get_setting("syriatel_code", DEFAULT_SYRIATEL_CODE) or DEFAULT_SYRIATEL_CODE).strip()
+
+
+def get_sham_cash_syp_code() -> str:
+    return (get_setting("sham_cash_syp_code", DEFAULT_SHAM_CASH_SYP_CODE) or DEFAULT_SHAM_CASH_SYP_CODE).strip()
+
+
+def get_sham_cash_usd_code() -> str:
+    return (get_setting("sham_cash_usd_code", DEFAULT_SHAM_CASH_USD_CODE) or DEFAULT_SHAM_CASH_USD_CODE).strip()
+
+
+def get_sham_cash_usd_rate_syp() -> float:
+    raw = get_setting("sham_cash_usd_rate_syp")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return DEFAULT_SHAM_CASH_USD_RATE_SYP
+
+
+def get_withdraw_usd_rate_syp() -> float:
+    raw = get_setting("withdraw_usd_rate_syp")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return DEFAULT_WITHDRAW_USD_RATE_SYP
+
+
+def get_withdraw_commission_rate() -> float:
+    raw = get_setting("withdraw_commission_rate")
+    if raw:
+        try:
+            val = float(raw)
+            if 0.0 <= val < 1.0:
+                return val
+        except ValueError:
+            pass
+    return DEFAULT_WITHDRAW_COMMISSION_RATE
+
+
+def get_button_config(button_key: str) -> sqlite3.Row | None:
+    """جلب إعدادات الرسالة والصورة المخصصة لزر معين."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM button_configs WHERE button_key = ?",
+            (button_key,),
+        ).fetchone()
+
+
+def save_button_message(button_key: str, custom_message: str | None):
+    """حفظ أو مسح رسالة مخصصة لزر معين."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    existing = get_button_config(button_key)
+    photo_id = existing["photo_file_id"] if existing else None
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO button_configs (button_key, custom_message, photo_file_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(button_key) DO UPDATE SET
+                custom_message = excluded.custom_message,
+                updated_at = excluded.updated_at
+            """,
+            (button_key, custom_message, photo_id, now_str),
+        )
+        conn.commit()
+
+
+def save_button_photo(button_key: str, photo_file_id: str | None):
+    """حفظ أو حذف صورة مخصصة لزر معين."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    existing = get_button_config(button_key)
+    custom_msg = existing["custom_message"] if existing else None
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO button_configs (button_key, custom_message, photo_file_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(button_key) DO UPDATE SET
+                photo_file_id = excluded.photo_file_id,
+                updated_at = excluded.updated_at
+            """,
+            (button_key, custom_msg, photo_file_id, now_str),
+        )
+        conn.commit()
+
+
+def send_custom_button_media_if_any(chat_id: int, button_key: str, default_caption: str | None = None):
+    """إرسال صورة الزر المخصصة إذا وُجدت (مع الرسالة المخصصة أو الافتراضية)."""
+    cfg = get_button_config(button_key)
+    if not cfg:
+        return False
+    photo_id = cfg["photo_file_id"]
+    custom_msg = (cfg["custom_message"] or "").strip() if cfg["custom_message"] else None
+    if photo_id:
+        caption = custom_msg if custom_msg is not None else (default_caption or "")
+        bot.send_photo(chat_id, photo=str(photo_id), caption=caption or None)
+        return True
+    return False
+
+
+def get_custom_button_text(button_key: str, default_text: str) -> str:
+    """إرجاع الرسالة المخصصة للزر إذا تم ضبطها من لوحة التحكم أو النص الافتراضي."""
+    cfg = get_button_config(button_key)
+    if cfg and cfg["custom_message"] is not None and str(cfg["custom_message"]).strip() != "":
+        return str(cfg["custom_message"])
+    return default_text
+
+
+def get_ola276_chat_id() -> int | None:
+    """إرجاع معرف محادثة المشرف الرئيسي Ola276."""
+    val = get_setting("ola276_chat_id")
+    if val and val.isdigit():
+        return int(val)
+    return None
+
+
+def sync_ola276_identity(user):
+    """تثبيت معرف المشرف الرئيسي Ola276 عند تواصله مع البوت."""
+    if not user:
+        return
+    uname = (user.username or "").lstrip("@").strip().lower()
+    if uname == ADMIN_USERNAME.lower():
+        set_setting("ola276_chat_id", str(user.id))
+
+
+def is_main_admin(user) -> bool:
+    """التحقق الحصري من أن المستخدم هو المشرف الرئيسي Ola276."""
+    if not user:
+        return False
+    uname = (user.username or "").lstrip("@").strip().lower()
+    if uname and uname == ADMIN_USERNAME.lower():
+        set_setting("ola276_chat_id", str(user.id))
+        return True
+    ola_id = get_ola276_chat_id()
+    return ola_id is not None and int(user.id) == ola_id
+
+
+def set_user_state(user_id: int, state: str | None, temp_data: str | None = None):
+    """حفظ أو مسح حالة المحادثة الحالية للمستخدم."""
+    with get_connection() as conn:
+        if state is None:
+            conn.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
+        else:
+            now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """
+                INSERT INTO user_states (user_id, state, temp_data, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    state = excluded.state,
+                    temp_data = excluded.temp_data,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, state, temp_data, now_str),
+            )
+        conn.commit()
+
+
+def get_user_state(user_id: int) -> tuple[str | None, str | None]:
+    """قراءة حالة المحادثة الحالية للمستخدم."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT state, temp_data FROM user_states WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None, None
+        return row["state"], row["temp_data"]
+
+
+def get_active_ichancy_account(user_id: int) -> sqlite3.Row | None:
+    """التحقق ما إذا كان لدى المشترك حساب ichancy مفعل مسبقاً."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM ichancy_accounts WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def save_active_ichancy_account(user_id: int, acc_username: str, acc_password: str):
+    """حفظ حساب ichancy المفعل نهائياً للمستخدم."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO ichancy_accounts (user_id, acc_username, acc_password, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                acc_username = excluded.acc_username,
+                acc_password = excluded.acc_password
+            """,
+            (user_id, acc_username, acc_password, now_str),
+        )
+        conn.commit()
+
+
+def create_account_request(user_id: int, acc_username: str, acc_password: str) -> int:
+    """إنشاء طلب إنشاء حساب جديد وإرجاع رقم الطلب."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO account_requests (user_id, acc_username, acc_password, status, created_at)
+            VALUES (?, ?, ?, 'pending', ?)
+            """,
+            (user_id, acc_username, acc_password, now_str),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_account_request(req_id: int) -> sqlite3.Row | None:
+    """جلب بيانات طلب إنشاء الحساب."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM account_requests WHERE id = ?",
+            (req_id,),
+        ).fetchone()
+
+
+def update_request_username(req_id: int, new_username: str):
+    """تحديث اسم الحساب داخل طلب معلق."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE account_requests SET acc_username = ? WHERE id = ?",
+            (new_username, req_id),
+        )
+        conn.commit()
+
+
+def update_request_password(req_id: int, new_password: str):
+    """تحديث كلمة المرور داخل طلب معلق."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE account_requests SET acc_password = ? WHERE id = ?",
+            (new_password, req_id),
+        )
+        conn.commit()
+
+
+def set_request_status(req_id: int, status: str):
+    """تحديث حالة الطلب (approved / rejected)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE account_requests SET status = ? WHERE id = ?",
+            (status, req_id),
+        )
+        conn.commit()
+
+
+def create_bot_deposit_request(user_id: int, method: str, amount: float, tx_number: str) -> int:
+    """إنشاء طلب شحن رصيد إلى البوت وإرجاع رقم الطلب."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO bot_deposit_requests (user_id, method, amount, tx_number, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (user_id, method, amount, tx_number, now_str),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_bot_deposit_request(dep_id: int) -> sqlite3.Row | None:
+    """جلب بيانات طلب شحن رصيد إلى البوت."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM bot_deposit_requests WHERE id = ?",
+            (dep_id,),
+        ).fetchone()
+
+
+def set_bot_deposit_status(dep_id: int, status: str):
+    """تحديث حالة طلب شحن البوت."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE bot_deposit_requests SET status = ? WHERE id = ?",
+            (status, dep_id),
+        )
+        conn.commit()
+
+
+def create_bot_withdraw_request(
+    user_id: int,
+    method: str,
+    destination: str,
+    amount: float,
+    commission: float,
+    net_amount: float,
+) -> int:
+    """إنشاء طلب سحب رصيد من البوت وإرجاع رقم الطلب."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO bot_withdraw_requests (
+                user_id, method, destination, amount, commission, net_amount, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (user_id, method, destination, amount, commission, net_amount, now_str),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_bot_withdraw_request(w_id: int) -> sqlite3.Row | None:
+    """جلب بيانات طلب سحب رصيد من البوت."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM bot_withdraw_requests WHERE id = ?",
+            (w_id,),
+        ).fetchone()
+
+
+def approve_withdraw_and_deduct_balance(w_id: int) -> tuple[str, float]:
+    """تنفيذ الموافقة على طلب السحب وخصم المبلغ من رصيد البوت في معاملة واحدة."""
+    with get_connection() as conn:
+        w_row = conn.execute(
+            "SELECT * FROM bot_withdraw_requests WHERE id = ?",
+            (w_id,),
+        ).fetchone()
+        if not w_row:
+            return "not_found", 0.0
+        if w_row["status"] != "pending":
+            user_row = conn.execute(
+                "SELECT balance FROM users WHERE user_id = ?",
+                (int(w_row["user_id"]),),
+            ).fetchone()
+            bal = float(user_row["balance"]) if user_row else 0.0
+            return "not_pending", bal
+
+        target_user_id = int(w_row["user_id"])
+        amount = round(float(w_row["amount"]), 2)
+        user_row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (target_user_id,),
+        ).fetchone()
+        current_balance = float(user_row["balance"]) if user_row else 0.0
+
+        if current_balance < amount:
+            return "insufficient_balance", current_balance
+
+        conn.execute(
+            """
+            UPDATE users
+            SET balance = ROUND(balance - ?, 2)
+            WHERE user_id = ?
+            """,
+            (amount, target_user_id),
+        )
+        conn.execute(
+            """
+            UPDATE bot_withdraw_requests
+            SET status = 'approved'
+            WHERE id = ? AND status = 'pending'
+            """,
+            (w_id,),
+        )
+        conn.commit()
+
+        updated_row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (target_user_id,),
+        ).fetchone()
+        new_balance = float(updated_row["balance"]) if updated_row else 0.0
+        return "approved", new_balance
+
+
+def set_bot_withdraw_status(w_id: int, status: str):
+    """تحديث حالة طلب سحب البوت."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE bot_withdraw_requests SET status = ? WHERE id = ?",
+            (status, w_id),
+        )
+        conn.commit()
+
+
+def create_account_transfer_request(
+    user_id: int,
+    transfer_type: str,
+    acc_username: str,
+    amount: float,
+) -> int:
+    """إنشاء طلب شحن أو سحب رصيد في حساب المنصة وإرجاع رقم الطلب."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO account_transfer_requests (
+                user_id, transfer_type, acc_username, amount, status, created_at
+            )
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (user_id, transfer_type, acc_username, amount, now_str),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_account_transfer_request(tr_id: int) -> sqlite3.Row | None:
+    """جلب بيانات طلب شحن أو سحب رصيد في حساب المنصة."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM account_transfer_requests WHERE id = ?",
+            (tr_id,),
+        ).fetchone()
+
+
+def set_account_transfer_status(tr_id: int, status: str):
+    """تحديث حالة طلب شحن أو سحب الحساب."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE account_transfer_requests SET status = ? WHERE id = ?",
+            (status, tr_id),
+        )
+        conn.commit()
+
+
+def approve_account_deposit_and_deduct_bot_balance(tr_id: int) -> tuple[str, float]:
+    """الموافقة على شحن الحساب في المنصة وخصم المبلغ تلقائياً من رصيد البوت."""
+    with get_connection() as conn:
+        tr_row = conn.execute(
+            "SELECT * FROM account_transfer_requests WHERE id = ?",
+            (tr_id,),
+        ).fetchone()
+        if not tr_row:
+            return "not_found", 0.0
+        if tr_row["status"] != "pending":
+            user_row = conn.execute(
+                "SELECT balance FROM users WHERE user_id = ?",
+                (int(tr_row["user_id"]),),
+            ).fetchone()
+            bal = float(user_row["balance"]) if user_row else 0.0
+            return "not_pending", bal
+
+        target_user_id = int(tr_row["user_id"])
+        amount = round(float(tr_row["amount"]), 2)
+        user_row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (target_user_id,),
+        ).fetchone()
+        current_balance = float(user_row["balance"]) if user_row else 0.0
+
+        if current_balance < amount:
+            return "insufficient_balance", current_balance
+
+        conn.execute(
+            """
+            UPDATE users
+            SET balance = ROUND(balance - ?, 2)
+            WHERE user_id = ?
+            """,
+            (amount, target_user_id),
+        )
+        conn.execute(
+            """
+            UPDATE account_transfer_requests
+            SET status = 'approved'
+            WHERE id = ? AND status = 'pending'
+            """,
+            (tr_id,),
+        )
+        conn.commit()
+
+        updated_row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (target_user_id,),
+        ).fetchone()
+        new_balance = float(updated_row["balance"]) if updated_row else 0.0
+        return "approved", new_balance
+
+
+def approve_account_withdraw_and_add_bot_balance(tr_id: int) -> tuple[str, float]:
+    """الموافقة على سحب الرصيد من الحساب وإضافة المبلغ تلقائياً إلى رصيد البوت."""
+    with get_connection() as conn:
+        tr_row = conn.execute(
+            "SELECT * FROM account_transfer_requests WHERE id = ?",
+            (tr_id,),
+        ).fetchone()
+        if not tr_row:
+            return "not_found", 0.0
+        if tr_row["status"] != "pending":
+            user_row = conn.execute(
+                "SELECT balance FROM users WHERE user_id = ?",
+                (int(tr_row["user_id"]),),
+            ).fetchone()
+            bal = float(user_row["balance"]) if user_row else 0.0
+            return "not_pending", bal
+
+        target_user_id = int(tr_row["user_id"])
+        amount = round(float(tr_row["amount"]), 2)
+
+        conn.execute(
+            """
+            UPDATE users
+            SET balance = ROUND(balance + ?, 2)
+            WHERE user_id = ?
+            """,
+            (amount, target_user_id),
+        )
+        conn.execute(
+            """
+            UPDATE account_transfer_requests
+            SET status = 'approved'
+            WHERE id = ? AND status = 'pending'
+            """,
+            (tr_id,),
+        )
+        conn.commit()
+
+        updated_row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (target_user_id,),
+        ).fetchone()
+        new_balance = float(updated_row["balance"]) if updated_row else 0.0
+        return "approved", new_balance
+
+
+def create_support_ticket(
+    user_id: int,
+    message_type: str,
+    content_text: str | None = None,
+    photo_file_id: str | None = None,
+) -> int:
+    """إنشاء تذكرة دعم جديدة وإرجاع رقمها."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO support_tickets (
+                user_id, message_type, content_text, photo_file_id, status, created_at
+            )
+            VALUES (?, ?, ?, ?, 'open', ?)
+            """,
+            (user_id, message_type, content_text, photo_file_id, now_str),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_support_ticket(ticket_id: int) -> sqlite3.Row | None:
+    """جلب بيانات تذكرة الدعم."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM support_tickets WHERE id = ?",
+            (ticket_id,),
+        ).fetchone()
+
+
+def mark_support_ticket_replied(ticket_id: int):
+    """تحديث حالة تذكرة الدعم إلى تم الرد."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE support_tickets SET status = 'replied' WHERE id = ?",
+            (ticket_id,),
+        )
+        conn.commit()
+
+
+def get_user_bot_operations_history(user_id: int) -> list[dict]:
+    """
+    جلب جميع عمليات الشحن إلى البوت وعمليات السحب من البوت للمشترك
+    من تاريخ إنشاء حسابه حتى وقت الطلب مرتبة زمنياً من الأحدث إلى الأقدم.
+    """
+    with get_connection() as conn:
+        user_row = conn.execute(
+            "SELECT created_at FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        account_created_at = user_row["created_at"] if user_row else None
+
+        if account_created_at:
+            dep_rows = conn.execute(
+                """
+                SELECT id, method, amount, status, created_at
+                FROM bot_deposit_requests
+                WHERE user_id = ? AND created_at >= ?
+                ORDER BY id DESC
+                """,
+                (user_id, account_created_at),
+            ).fetchall()
+
+            wdr_rows = conn.execute(
+                """
+                SELECT id, method, amount, net_amount, status, created_at
+                FROM bot_withdraw_requests
+                WHERE user_id = ? AND created_at >= ?
+                ORDER BY id DESC
+                """,
+                (user_id, account_created_at),
+            ).fetchall()
+        else:
+            dep_rows = conn.execute(
+                """
+                SELECT id, method, amount, status, created_at
+                FROM bot_deposit_requests
+                WHERE user_id = ?
+                ORDER BY id DESC
+                """,
+                (user_id,),
+            ).fetchall()
+
+            wdr_rows = conn.execute(
+                """
+                SELECT id, method, amount, net_amount, status, created_at
+                FROM bot_withdraw_requests
+                WHERE user_id = ?
+                ORDER BY id DESC
+                """,
+                (user_id,),
+            ).fetchall()
+
+    operations = []
+    for r in dep_rows:
+        operations.append(
+            {
+                "kind": "deposit",
+                "id": int(r["id"]),
+                "method": str(r["method"]),
+                "amount": float(r["amount"]),
+                "net_amount": None,
+                "status": str(r["status"]),
+                "created_at": str(r["created_at"]),
+            }
+        )
+    for r in wdr_rows:
+        operations.append(
+            {
+                "kind": "withdraw",
+                "id": int(r["id"]),
+                "method": str(r["method"]),
+                "amount": float(r["amount"]),
+                "net_amount": float(r["net_amount"]),
+                "status": str(r["status"]),
+                "created_at": str(r["created_at"]),
+            }
+        )
+
+    operations.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
+    return operations
+
+
+def is_first_time_user(user_id: int) -> bool:
+    """التحقق ما إذا كان المشترك يدخل البوت للمرة الأولى."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return row is None
+
+
+def ensure_user(user) -> float:
+    """إضافة المستخدم إذا لم يكن مسجلاً وإرجاع رصيده الحالي."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO users (user_id, username, first_name, balance, created_at)
+            VALUES (?, ?, ?, 0.0, ?)
+            """,
+            (user.id, user.username, user.first_name, now_str),
+        )
+        conn.execute(
+            """
+            UPDATE users
+            SET username = ?, first_name = ?
+            WHERE user_id = ?
+            """,
+            (user.username, user.first_name, user.id),
+        )
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (user.id,),
+        ).fetchone()
+        return float(row["balance"]) if row else 0.0
+
+
+def get_user_row_by_id(user_id: int) -> sqlite3.Row | None:
+    """جلب سجل المستخدم من قاعدة البيانات عبر الآيدي."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def find_user_by_query(query: str) -> sqlite3.Row | None:
+    """البحث عن مستخدم عبر الآيدي أو المعرف (@username)."""
+    q = query.strip().lstrip("@")
+    with get_connection() as conn:
+        if q.isdigit():
+            row = conn.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (int(q),),
+            ).fetchone()
+            if row:
+                return row
+        return conn.execute(
+            "SELECT * FROM users WHERE LOWER(COALESCE(username, '')) = LOWER(?)",
+            (q,),
+        ).fetchone()
+
+
+def get_user_balance(user) -> float:
+    """جلب رصيد المستخدم من قاعدة البيانات."""
+    return ensure_user(user)
+
+
+def add_user_balance(user_id: int, amount: float) -> float:
+    """إضافة مبلغ إلى رصيد المستخدم في قاعدة البيانات وإرجاع الرصيد الجديد."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET balance = ROUND(balance + ?, 2)
+            WHERE user_id = ?
+            """,
+            (amount, user_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return float(row["balance"]) if row else 0.0
+
+
+def set_user_balance_exact(user_id: int, new_balance: float) -> float:
+    """تعيين رصيد محدد للمشترك وإرجاع الرصيد بعد التعديل."""
+    clean_val = round(max(0.0, new_balance), 2)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET balance = ?
+            WHERE user_id = ?
+            """,
+            (clean_val, user_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return float(row["balance"]) if row else 0.0
+
+
+def get_bot_stats() -> dict:
+    """جلب إحصائيات سريعة للبوت من قاعدة البيانات."""
+    with get_connection() as conn:
+        users_count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        total_bal = conn.execute("SELECT COALESCE(SUM(balance), 0) AS s FROM users").fetchone()["s"]
+        acc_count = conn.execute("SELECT COUNT(*) AS c FROM ichancy_accounts").fetchone()["c"]
+        pending_acc = conn.execute("SELECT COUNT(*) AS c FROM account_requests WHERE status='pending'").fetchone()["c"]
+        pending_dep = conn.execute("SELECT COUNT(*) AS c FROM bot_deposit_requests WHERE status='pending'").fetchone()["c"]
+        pending_wdr = conn.execute("SELECT COUNT(*) AS c FROM bot_withdraw_requests WHERE status='pending'").fetchone()["c"]
+        pending_tr = conn.execute("SELECT COUNT(*) AS c FROM account_transfer_requests WHERE status='pending'").fetchone()["c"]
+        open_tickets = conn.execute("SELECT COUNT(*) AS c FROM support_tickets WHERE status='open'").fetchone()["c"]
+    return {
+        "users_count": int(users_count),
+        "total_balance": float(total_bal),
+        "acc_count": int(acc_count),
+        "pending_acc": int(pending_acc),
+        "pending_dep": int(pending_dep),
+        "pending_wdr": int(pending_wdr),
+        "pending_tr": int(pending_tr),
+        "open_tickets": int(open_tickets),
+    }
+
+
+def is_user_subscribed(user_id: int) -> bool:
+    """التحقق من اشتراك المستخدم في قناة البوت."""
+    ch_username = get_channel_username()
     try:
-        member = await bot_obj.get_chat_member(chat_id=channel, user_id=user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except Exception:
+        member = bot.get_chat_member(ch_username, user_id)
+        return member.status in {"creator", "administrator", "member"}
+    except Exception as exc:
+        print(f"Subscription check error for user {user_id}: {exc}")
         return False
 
 
-def get_next_payout_date() -> str:
-    today = date.today()
-    day = today.day
-    if day <= 10:
-        target = date(today.year, today.month, 10)
-    elif day <= 20:
-        target = date(today.year, today.month, 20)
+def format_amount(amount: float) -> str:
+    """تنسيق المبلغ بدون أصفار عشرية زائدة إذا كان عدداً صحيحاً."""
+    if float(amount).is_integer():
+        return str(int(amount))
+    return f"{amount:.2f}"
+
+
+def force_sub_keyboard() -> InlineKeyboardMarkup:
+    """أزرار الاشتراك الإجباري والتأكد من الاشتراك."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("الاشتراك في القناة", url=get_channel_url()),
+    )
+    markup.row(
+        InlineKeyboardButton("التاكد من الاشتراك ✅", callback_data="verify_sub"),
+    )
+    return markup
+
+
+def main_features_keyboard() -> InlineKeyboardMarkup:
+    """الأزرار العشرة الرئيسية مع تبديل الزر الثاني مكان الثالث والرابع مكان الخامس."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("⚡ichancy ⚡", callback_data="btn_ichancy"),
+    )
+    markup.row(
+        InlineKeyboardButton("شحن رصيد الى البوت ⬇️", callback_data="btn_deposit_bot"),
+        InlineKeyboardButton("سحب رصيد من البوت ⬆️", callback_data="btn_withdraw_bot"),
+    )
+    markup.row(
+        InlineKeyboardButton("شحن رصيد في الحساب 🔽", callback_data="btn_deposit_acc"),
+        InlineKeyboardButton("سحب رصيد من الحساب 🔼", callback_data="btn_withdraw_acc"),
+    )
+    remaining_buttons = [
+        ("السجلات 🗃️", "btn_logs"),
+        ("التواصل مع الدعم 📩", "btn_support"),
+        ("العروض الحاليه 🎁", "btn_offers"),
+        ("الشروط والاحكام 📝", "btn_terms"),
+        ("الياناصيب الاسبوعي💵", "btn_lottery"),
+    ]
+    for label, cb_data in remaining_buttons:
+        markup.row(InlineKeyboardButton(label, callback_data=cb_data))
+    return markup
+
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    """القائمة الرئيسية للوحة تحكم المشرف Ola276."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("📊 الإحصائيات", callback_data="adm_stats"),
+        InlineKeyboardButton("💰 تعديل رصيد مشترك", callback_data="adm_user_bal"),
+    )
+    markup.row(
+        InlineKeyboardButton("✏️ تغيير رسالة زر", callback_data="adm_edit_btn_msg"),
+        InlineKeyboardButton("🖼️ صورة لأي زر", callback_data="adm_edit_btn_photo"),
+    )
+    markup.row(
+        InlineKeyboardButton("⚙️ إعدادات القناة والأكواد", callback_data="adm_settings"),
+        InlineKeyboardButton("📣 إذاعة جماعية", callback_data="adm_broadcast"),
+    )
+    markup.row(
+        InlineKeyboardButton("القائمه الرئيسيه ♻️", callback_data="back_to_main_menu"),
+    )
+    return markup
+
+
+def admin_buttons_picker_keyboard(mode: str) -> InlineKeyboardMarkup:
+    """قائمة اختيار أي زر لتعديل رسالته أو صورته (mode: 'msg' أو 'photo')."""
+    markup = InlineKeyboardMarkup()
+    for btn_key, btn_label in CUSTOMIZABLE_BUTTONS:
+        cfg = get_button_config(btn_key)
+        has_photo = " 🖼️" if (cfg and cfg["photo_file_id"]) else ""
+        has_msg = " ✍️" if (cfg and cfg["custom_message"]) else ""
+        markup.row(
+            InlineKeyboardButton(
+                f"{btn_label}{has_msg}{has_photo}",
+                callback_data=f"adm_pick_{mode}:{btn_key}",
+            )
+        )
+    markup.row(
+        InlineKeyboardButton("⬅️ رجوع للوحة التحكم", callback_data="adm_open_panel"),
+    )
+    return markup
+
+
+def admin_single_button_actions_keyboard(btn_key: str) -> InlineKeyboardMarkup:
+    """خيارات التعديل لزر محدد (تغيير الرسالة، حذف الرسالة المخصصة، إضافة/تغيير الصورة، حذف الصورة)."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("✍️ كتابة / تغيير رسالة الزر", callback_data=f"adm_set_msg:{btn_key}"),
+        InlineKeyboardButton("🗑️ حذف الرسالة المخصصة", callback_data=f"adm_del_msg:{btn_key}"),
+    )
+    markup.row(
+        InlineKeyboardButton("🖼️ إضافة / تغيير صورة الزر", callback_data=f"adm_set_photo:{btn_key}"),
+        InlineKeyboardButton("🚫 حذف صورة الزر", callback_data=f"adm_del_photo:{btn_key}"),
+    )
+    markup.row(
+        InlineKeyboardButton("⬅️ رجوع للأزرار", callback_data="adm_edit_btn_msg"),
+    )
+    return markup
+
+
+def admin_settings_keyboard() -> InlineKeyboardMarkup:
+    """إعدادات القناة وأكواد الشحن والأسعار."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("📢 قناة الاشتراك", callback_data="adm_set_channel"),
+        InlineKeyboardButton("💱 سعر الصرف والعمولة", callback_data="adm_set_rates"),
+    )
+    markup.row(
+        InlineKeyboardButton("📱 كود سيرياتيل كاش", callback_data="adm_set_code_syr"),
+    )
+    markup.row(
+        InlineKeyboardButton("💵 كود شام كاش سوري", callback_data="adm_set_code_sham_syp"),
+        InlineKeyboardButton("💲 كود شام كاش دولار", callback_data="adm_set_code_sham_usd"),
+    )
+    markup.row(
+        InlineKeyboardButton("⬅️ رجوع للوحة التحكم", callback_data="adm_open_panel"),
+    )
+    return markup
+
+
+def bot_deposit_methods_keyboard() -> InlineKeyboardMarkup:
+    """أزرار طرق الشحن المتاحة إلى البوت."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("سريتيل كاش 🪙", callback_data="dep_method_syriatel"),
+    )
+    markup.row(
+        InlineKeyboardButton("شام كاش سوري 💵", callback_data="dep_method_sham_syp"),
+    )
+    markup.row(
+        InlineKeyboardButton("شام كاش دولار 💲", callback_data="dep_method_sham_usd"),
+    )
+    markup.row(
+        InlineKeyboardButton("بنك بيمو 🏛️", callback_data="dep_method_bemo"),
+    )
+    markup.row(
+        InlineKeyboardButton("القائمه الرئيسيه ♻️", callback_data="back_to_main_menu"),
+    )
+    return markup
+
+
+def bot_withdraw_methods_keyboard() -> InlineKeyboardMarkup:
+    """أزرار طرق السحب المتاحة من البوت."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("سريتيل كاش 🪙", callback_data="wdr_method_syriatel"),
+    )
+    markup.row(
+        InlineKeyboardButton("شام كاش سوري 💵", callback_data="wdr_method_sham_syp"),
+    )
+    markup.row(
+        InlineKeyboardButton("شام كاش دولار 💲", callback_data="wdr_method_sham_usd"),
+    )
+    markup.row(
+        InlineKeyboardButton("بنك بيمو 🏛️", callback_data="wdr_method_bemo"),
+    )
+    markup.row(
+        InlineKeyboardButton("القائمه الرئيسيه ♻️", callback_data="back_to_main_menu"),
+    )
+    return markup
+
+
+def ichancy_menu_keyboard() -> InlineKeyboardMarkup:
+    """قائمة قسم ichancy: إنشاء حساب جديد والقائمة الرئيسية."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("أنشاء حساب جديد", callback_data="ichancy_create"),
+    )
+    markup.row(
+        InlineKeyboardButton("القائمه الرئيسيه", callback_data="back_to_main_menu"),
+    )
+    return markup
+
+
+def cancel_to_main_keyboard() -> InlineKeyboardMarkup:
+    """زر إلغاء والعودة للقائمة الرئيسية."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("إلغاء والعوده للقائمه الرئيسيه ♻️", callback_data="back_to_main_menu"),
+    )
+    return markup
+
+
+def support_cancel_keyboard() -> InlineKeyboardMarkup:
+    """زر إلغاء لرسالة التواصل مع الدعم."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("إلغاء ❌", callback_data="support_cancel"),
+    )
+    return markup
+
+
+def admin_support_reply_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
+    """زر الرد للمشرف على رسالة الدعم القادمة من المشترك."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("رد 💬", callback_data=f"sup_reply:{ticket_id}"),
+    )
+    return markup
+
+
+def admin_request_keyboard(req_id: int) -> InlineKeyboardMarkup:
+    """أزرار تحكم المشرف الرئيسي على طلب إنشاء الحساب."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("موافقة ✅", callback_data=f"req_approve:{req_id}"),
+        InlineKeyboardButton("رفض ❌", callback_data=f"req_reject:{req_id}"),
+    )
+    markup.row(
+        InlineKeyboardButton("تعديل الاسم ✏️", callback_data=f"req_edit_user:{req_id}"),
+        InlineKeyboardButton("تعديل كلمة المرور 🔑", callback_data=f"req_edit_pass:{req_id}"),
+    )
+    return markup
+
+
+def admin_deposit_keyboard(dep_id: int) -> InlineKeyboardMarkup:
+    """أزرار الموافقة أو الرفض لطلب شحن الرصيد إلى البوت."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("موافقة ✅", callback_data=f"dep_approve:{dep_id}"),
+        InlineKeyboardButton("رفض ❌", callback_data=f"dep_reject:{dep_id}"),
+    )
+    return markup
+
+
+def admin_withdraw_keyboard(w_id: int) -> InlineKeyboardMarkup:
+    """أزرار الموافقة أو الرفض لطلب سحب الرصيد من البوت."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("موافقة ✅", callback_data=f"wdr_approve:{w_id}"),
+        InlineKeyboardButton("رفض ❌", callback_data=f"wdr_reject:{w_id}"),
+    )
+    return markup
+
+
+def admin_account_transfer_keyboard(tr_id: int) -> InlineKeyboardMarkup:
+    """أزرار الموافقة أو الرفض لطلب شحن أو سحب رصيد في الحساب."""
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("موافقة ✅", callback_data=f"acc_tr_approve:{tr_id}"),
+        InlineKeyboardButton("رفض ❌", callback_data=f"acc_tr_reject:{tr_id}"),
+    )
+    return markup
+
+
+def send_admin_panel(chat_id: int):
+    """إرسال لوحة تحكم المشرف الرئيسي Ola276."""
+    stats = get_bot_stats()
+    text = (
+        f"🛠️ <b>لوحة تحكم المشرف الرئيسي (@{ADMIN_USERNAME})</b>\n\n"
+        f"👥 المشتركون: <b>{stats['users_count']}</b> | 🏦 حسابات ichancy: <b>{stats['acc_count']}</b>\n"
+        f"💰 مجموع أرصدة البوت: <b>{format_amount(stats['total_balance'])} SYP</b>\n"
+        f"⏳ طلبات معلقة: حسابات (<b>{stats['pending_acc']}</b>) | شحن (<b>{stats['pending_dep']}</b>) | سحب (<b>{stats['pending_wdr']}</b>) | تحويلات (<b>{stats['pending_tr']}</b>)\n"
+        f"📩 رسائل دعم مفتوحة: <b>{stats['open_tickets']}</b>"
+    )
+    bot.send_message(chat_id, text, reply_markup=admin_panel_keyboard())
+
+
+def send_force_sub_message(chat_id: int, is_new_user: bool = False):
+    """إرسال رسالة الترحيب للمشترك الجديد أو رسالة الاشتراك الإجباري."""
+    text = (
+        "مرحبا بك معنا 🌸\n\n"
+        "للاستمرار واستخدام البوت، يرجى الاشتراك في قناة البوت أولاً ثم الضغط على "
+        "<b>التاكد من الاشتراك ✅</b>:"
+        if is_new_user
+        else "عذراً، يجب الاشتراك في قناة البوت أولاً للمتابعة.\n"
+        "بعد الاشتراك اضغط على <b>التاكد من الاشتراك ✅</b>:"
+    )
+    bot.send_message(chat_id, text, reply_markup=force_sub_keyboard())
+
+
+def setup_bottom_menu(chat_id: int, user=None):
+    """ضبط زر القائمة في الشريط السفلي: يظهر خيار (لوحة التحكم) للمشرف الرئيسي فقط."""
+    commands = [
+        BotCommand("start", "أبدء"),
+        BotCommand("balance", "رصيدي"),
+    ]
+    if is_main_admin(user):
+        commands.append(BotCommand("admin", "لوحة التحكم"))
+    bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id))
+    bot.set_chat_menu_button(chat_id=chat_id, menu_button=MenuButtonCommands())
+
+
+def format_display_username(user) -> str:
+    """تنسيق اسم المستخدم لعرضه في رسالة (أبدء)."""
+    if user.username:
+        return f"@{user.username}"
+    return user.first_name or "غير محدد"
+
+
+def build_start_profile_text(user, balance: float) -> str:
+    """بناء رسالة (أبدء) بالصيغة المطلوبة."""
+    display_user = format_display_username(user)
+    return (
+        f"👤اسم المستخدم : {display_user}\n"
+        f"🆔: <code>{user.id}</code>\n"
+        f"رصيد البوت : <b>{balance:.2f}</b>"
+    )
+
+
+def send_main_menu_message(chat_id: int, user):
+    """إرسال القائمة الرئيسية للمشترك."""
+    balance = ensure_user(user)
+    bot.send_message(
+        chat_id,
+        build_start_profile_text(user, balance),
+        reply_markup=main_features_keyboard(),
+    )
+
+
+def send_support_ticket_to_ola276(ticket_id: int) -> bool:
+    """إرسال رسالة الدعم الخاصة بالمشترك مرفقة بمعلوماته الشخصية وزر الرد إلى المشرف Ola276."""
+    ticket = get_support_ticket(ticket_id)
+    if not ticket:
+        return False
+
+    ola_chat_id = get_ola276_chat_id()
+    if not ola_chat_id:
+        print(f"Pending support ticket #{ticket_id}: waiting for @{ADMIN_USERNAME} to message the bot once.")
+        return False
+
+    target_user_id = int(ticket["user_id"])
+    user_row = get_user_row_by_id(target_user_id)
+    full_name = (user_row["first_name"] if user_row and user_row["first_name"] else "غير محدد")
+    uname_display = (
+        f"@{user_row['username']}"
+        if user_row and user_row["username"]
+        else "غير متوفر"
+    )
+    current_balance = float(user_row["balance"]) if user_row else 0.0
+
+    header_info = (
+        f"📩 <b>رسالة جديدة من التواصل مع الدعم (#{ticket_id})</b>\n\n"
+        f"👤 الاسم: <b>{full_name}</b>\n"
+        f"🔗 المعرف: {uname_display}\n"
+        f"🆔 الآيدي: <code>{target_user_id}</code>\n"
+        f"💰 رصيد البوت: <b>{format_amount(current_balance)} SYP</b>"
+    )
+
+    if ticket["message_type"] == "photo" and ticket["photo_file_id"]:
+        caption = header_info
+        if ticket["content_text"]:
+            caption += f"\n\n📝 <b>الوصف / الرسالة:</b>\n{ticket['content_text']}"
+        bot.send_photo(
+            ola_chat_id,
+            photo=str(ticket["photo_file_id"]),
+            caption=caption,
+            reply_markup=admin_support_reply_keyboard(ticket_id),
+        )
     else:
-        if today.month == 12:
-            target = date(today.year + 1, 1, 10)
-        else:
-            target = date(today.year, today.month + 1, 10)
-    return target.strftime("%Y-%m-%d 00:00 (الساعة 12 ليلاً)")
+        body = f"{header_info}\n\n💬 <b>الرسالة:</b>\n{ticket['content_text'] or ''}"
+        bot.send_message(
+            ola_chat_id,
+            body,
+            reply_markup=admin_support_reply_keyboard(ticket_id),
+        )
+    return True
 
 
-# === لوحة التحكم الرئيسية للمشتركين ===
-def get_dashboard_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ichancy⚡ إنشاء حساب", callback_data="menu_ichancy_create")],
-        [
-            InlineKeyboardButton(text="شحن رصيد في البوت ⬇️", callback_data="bot_deposit"),
-            InlineKeyboardButton(text="سحب رصيد من البوت ⬆️", callback_data="bot_withdraw")
-        ],
-        [
-            InlineKeyboardButton(text="شحن رصيد في الحساب 🔽", callback_data="acc_deposit"),
-            InlineKeyboardButton(text="سحب رصيد من الحساب 🔼", callback_data="acc_withdraw")
-        ],
-        [InlineKeyboardButton(text="السجلات 🗃️", callback_data="bot_records")],
-        [InlineKeyboardButton(text="التواصل مع الدعم 📩", callback_data="bot_support")],
-        [InlineKeyboardButton(text="الإحالات 👪", callback_data="bot_referrals")],
-        [InlineKeyboardButton(text="العروض النشطه 🎁", callback_data="bot_offers")],
-        [InlineKeyboardButton(text="استرداد آخر طلب سحب ♻️", callback_data="restore_withdraw")]
-    ])
+def build_admin_request_text(req_row: sqlite3.Row) -> str:
+    """بناء رسالة طلب إنشاء الحساب للمشرف الرئيسي Ola276."""
+    status_ar = {
+        "pending": "قيد المراجعة",
+        "approved": "تمت الموافقة",
+        "rejected": "مرفوض",
+    }.get(req_row["status"], req_row["status"])
 
-
-# === لوحة تحكم المشرف الرئيسية (Admin Panel) ===
-def get_admin_panel_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 إرسال رسالة وصورة للجميع", callback_data="adm_broadcast")],
-        [InlineKeyboardButton(text="⚙️ تحديد نسبة عمولة السحب (%)", callback_data="adm_set_commission")],
-        [InlineKeyboardButton(text="🔄 حالة توزيع الطلبات بين المشرفين", callback_data="adm_dispatch_status")],
-        [InlineKeyboardButton(text="🔍 البحث عن معاملة برقمها التسلسلي", callback_data="adm_search_op_prompt")],
-        [InlineKeyboardButton(text="✏️ تعديل رسالة الترحيب والشروط", callback_data="adm_edit_welcome")],
-        [InlineKeyboardButton(text="🎁 تعديل رسالة العروض النشطة", callback_data="adm_edit_offers")],
-        [
-            InlineKeyboardButton(text="📝 تعديل رسائل وصور شحن البوت", callback_data="adm_edit_dep_menu"),
-        ],
-        [
-            InlineKeyboardButton(text="📝 تعديل رسائل سحب البوت", callback_data="adm_edit_wit_menu"),
-        ],
-        [
-            InlineKeyboardButton(text="👥 إدارة المشرفين الثانويين", callback_data="adm_manage_secondary"),
-        ],
-        [
-            InlineKeyboardButton(text="✏️ تغيير اسم البوت", callback_data="adm_change_name"),
-            InlineKeyboardButton(text="🖼️ تغيير صورة البوت", callback_data="adm_change_photo")
-        ],
-        [InlineKeyboardButton(text="⚙️ حالة البوت (تشغيل / إيقاف)", callback_data="adm_toggle_bot")],
-        [
-            InlineKeyboardButton(text="📥 سجل شحن البوت", callback_data="adm_log_bot_dep"),
-            InlineKeyboardButton(text="📤 سجل سحب البوت", callback_data="adm_log_bot_wit")
-        ],
-        [
-            InlineKeyboardButton(text="📊 إحصائيات البوت واليوم", callback_data="adm_stats"),
-            InlineKeyboardButton(text="📅 سجل شهري مخصص", callback_data="adm_monthly_log")
-        ],
-        [InlineKeyboardButton(text="👤 إدارة المشتركين (حذف / تعديل رصيد)", callback_data="adm_manage_users")],
-        [InlineKeyboardButton(text="🔄 تحديث اللوحة", callback_data="adm_refresh")]
-    ])
-
-
-def get_bot_deposit_methods_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="سريتيل كاش 🪙", callback_data="dep_syritel")],
-        [InlineKeyboardButton(text="شام كاش سوري 💵", callback_data="dep_sham_syp")],
-        [InlineKeyboardButton(text="شام كاش دولار 💲", callback_data="dep_sham_usd")],
-        [InlineKeyboardButton(text="رجوع ♻️", callback_data="back_to_dashboard")]
-    ])
-
-
-def get_bot_withdraw_methods_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="سيريتل كاش 🪙", callback_data="wit_syritel")],
-        [InlineKeyboardButton(text="شام كاش سوري 💵", callback_data="wit_sham_syp")],
-        [InlineKeyboardButton(text="شام كاش دولار 💲", callback_data="wit_sham_usd")],
-        [InlineKeyboardButton(text="رجوع ♻️", callback_data="back_to_dashboard")]
-    ])
-
-
-# === أمر لوحة تحكم المشرف /admin ===
-@dp.message(Command("admin"))
-async def cmd_admin_panel(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        await message.answer("❌ هذا الأمر خاص بالمشرفين فقط.")
-        return
-
-    await message.answer(
-        "👑 أهلاً بك في لوحة تحكم المشرف:\n\nاختر أحد الأقسام أدناه للتحكم بالبوت 👇",
-        reply_markup=get_admin_panel_keyboard()
+    return (
+        f"📥 <b>طلب إنشاء حساب ichancy جديد (#{req_row['id']})</b>\n"
+        f"المشرف الرئيسي: @{ADMIN_USERNAME}\n"
+        f"الحالة: <b>{status_ar}</b>\n\n"
+        f"🆔 آيدي المشترك: <code>{req_row['user_id']}</code>\n"
+        f"👤 اسم الحساب: <code>{req_row['acc_username']}</code>\n"
+        f"🔑 كلمة المرور: <code>{req_row['acc_password']}</code>"
     )
 
 
-@dp.callback_query(F.data == "adm_refresh")
-async def cb_adm_refresh(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    try:
-        await callback.message.edit_text(
-            "👑 أهلاً بك في لوحة تحكم المشرف:\n\nاختر أحد الأقسام أدناه للتحكم بالبوت 👇",
-            reply_markup=get_admin_panel_keyboard()
-        )
-    except Exception:
-        pass
-    await callback.answer("تم تحديث اللوحة بنجاح.")
+def send_request_to_ola276(req_id: int) -> bool:
+    """إرسال طلب إنشاء الحساب إلى المشرف الرئيسي Ola276 فقط."""
+    req_row = get_account_request(req_id)
+    if not req_row:
+        return False
+
+    ola_chat_id = get_ola276_chat_id()
+    if not ola_chat_id:
+        print(f"Pending account request #{req_id}: waiting for @{ADMIN_USERNAME} to message the bot once.")
+        return False
+
+    bot.send_message(
+        ola_chat_id,
+        build_admin_request_text(req_row),
+        reply_markup=admin_request_keyboard(req_id),
+    )
+    return True
 
 
-# ========================================================
-# === عرض حالة توزيع الطلبات بين المشرفين ===
-# ========================================================
-@dp.callback_query(F.data == "adm_dispatch_status")
-async def cb_adm_dispatch_status(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
+def send_deposit_request_to_ola276(dep_id: int) -> bool:
+    """إرسال طلب شحن الرصيد إلى المشرف الرئيسي Ola276."""
+    dep_row = get_bot_deposit_request(dep_id)
+    if not dep_row:
+        return False
 
-    admins = await get_all_admins()
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT value FROM bot_settings WHERE key = 'admin_dispatch_index'") as cur:
-            row = await cur.fetchone()
-            curr_idx = int(row[0]) if row else 0
+    ola_chat_id = get_ola276_chat_id()
+    if not ola_chat_id:
+        print(f"Pending deposit request #{dep_id}: waiting for @{ADMIN_USERNAME} to message the bot once.")
+        return False
 
-    text = f"🔄 **حالة توزيع الطلبات بين المشرفين (بالدور):**\n\n"
-    text += f"👥 إجمالي المشرفين في الخدمة: {len(admins)}\n"
-    for idx, adm in enumerate(admins):
-        marker = " ⬅️ (الطلب القادم سيُرسل له)" if idx == curr_idx else ""
-        text += f"• المشرف {idx+1} (`{adm}`){marker}\n"
+    user_row = get_user_row_by_id(int(dep_row["user_id"]))
+    uname_display = f"@{user_row['username']}" if user_row and user_row["username"] else (
+        user_row["first_name"] if user_row and user_row["first_name"] else "غير محدد"
+    )
+    current_balance = float(user_row["balance"]) if user_row else 0.0
+    amount = float(dep_row["amount"])
+    method = str(dep_row["method"])
+    usd_rate = get_sham_cash_usd_rate_syp()
 
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع للوحة 🔙", callback_data="adm_refresh")]])
-    try:
-        await callback.message.edit_text(text, reply_markup=back_kb)
-    except Exception:
-        pass
-    await callback.answer()
+    status_ar = {
+        "pending": "قيد المراجعة",
+        "approved": "تمت الموافقة",
+        "rejected": "مرفوض",
+    }.get(dep_row["status"], dep_row["status"])
 
-
-# ========================================================
-# === قسم تحديد نسبة عمولة السحب من قبل المشرف ===
-# ========================================================
-@dp.callback_query(F.data == "adm_set_commission")
-async def cb_adm_set_commission(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    
-    current_comm = await fetch_setting("withdraw_commission")
-    await state.set_state(AdminCommissionStates.waiting_for_commission_value)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع للوحة 🔙", callback_data="adm_refresh")]])
-    
-    try:
-        await callback.message.edit_text(
-            f"⚙️ **تحديد نسبة عمولة السحب:**\n\n"
-            f"النسبة الحالية المفعلة: `{current_comm}%`\n\n"
-            f"أرسل الآن النسبة الجديدة المطلوبة (أرقام صحيحة من `1` إلى `50`، أو أرسل `0` لإلغاء العمولة):",
-            reply_markup=back_kb
-        )
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(AdminCommissionStates.waiting_for_commission_value)
-async def process_admin_commission_value(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    
-    if not message.text:
-        await message.answer("❌ يرجى إرسال قيمة صالحة:")
-        return
-        
-    try:
-        comm_val = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال أرقام صحيحة فقط (من 1 إلى 50):")
-        return
-
-    if not (0 <= comm_val <= 50):
-        await message.answer("❌ عذراً، يجب أن تكون نسبة العمولة محددة بين `0%` و `50%` فقط. حاول مجدداً:")
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.cursor() as cursor:
-            await cursor.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('withdraw_commission', ?)", (str(comm_val),))
-        await db.commit()
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="لوحة التحكم الرئيسية 🔙", callback_data="adm_refresh")]])
-    await message.answer(f"✅ تم تحديث نسبة عمولة السحب بنجاح لتصبح: `{comm_val}%`", reply_markup=back_kb)
-    await state.clear()
-
-
-# ========================================================
-# === قسم البحث برقم العملية للمشرفين ===
-# ========================================================
-@dp.callback_query(F.data == "adm_search_op_prompt")
-async def cb_adm_search_op_prompt(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    
-    await state.set_state(AdminSearchOpStates.waiting_for_op_number)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع للوحة 🔙", callback_data="adm_refresh")]])
-    
-    try:
-        await callback.message.edit_text(
-            "🔍 **البحث عن معاملة مالية:**\n\nأرسل الآن رقم العملية التسلسلي (مثلاً: `12` أو `150`) للبحث عن تفاصيلها:",
-            reply_markup=back_kb
-        )
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(AdminSearchOpStates.waiting_for_op_number)
-async def process_admin_search_op_number(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    
-    if not message.text:
-        await message.answer("❌ يرجى إرسال رقم عملية صالح:")
-        return
-        
-    try:
-        op_num = int(message.text.strip().replace("#", ""))
-    except ValueError:
-        await message.answer("❌ يرجى إدخال أرقام صحيحة فقط لرقم العملية:")
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT op_number, user_id, action_type, amount, currency, created_at FROM financial_logs WHERE op_number = ?",
-            (op_num,)
-        ) as cur:
-            row = await cur.fetchone()
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="لوحة التحكم الرئيسية 🔙", callback_data="adm_refresh")]])
-
-    if not row:
-        await message.answer(
-            f"❌ عذراً، لم يتم العثور على أي معاملة مالية تحمل الرقم `#{op_num}`.",
-            reply_markup=back_kb
+    if method == "شام كاش دولار 💲":
+        syp_value = round(amount * usd_rate, 2)
+        amount_line = (
+            f"💵 المبلغ المراد شحنه: <b>{format_amount(amount)} USD</b> "
+            f"(ما يعادل <b>{format_amount(syp_value)} SYP</b>)"
         )
     else:
-        op_number, target_uid, action_type, amount, currency, created_at = row
-        act_name = "شحن البوت / إيداع" if "deposit" in action_type else "سحب من البوت"
-        
-        result_text = (
-            f"✅ **تم العثور على تفاصيل المعاملة بنجاح:**\n\n"
-            f"🔢 رقم العملية: `#{op_number}`\n"
-            f"👤 أيدي المشترك: `{target_uid}`\n"
-            f"📋 نوع المعاملة: {act_name}\n"
-            f"💵 القيمة: {amount} {currency}\n"
-            f"📅 تاريخ التسجيل: {created_at}"
+        amount_line = f"💵 المبلغ المراد شحنه: <b>{format_amount(amount)} SYP</b>"
+
+    text = (
+        f"💳 <b>طلب شحن رصيد إلى البوت (#{dep_row['id']})</b>\n"
+        f"الحالة: <b>{status_ar}</b>\n\n"
+        f"👤 اسم المشترك: {uname_display}\n"
+        f"🆔 آيدي المشترك: <code>{dep_row['user_id']}</code>\n"
+        f"💰 رصيد البوت الأساسي: <b>{format_amount(current_balance)} SYP</b>\n"
+        f"{amount_line}\n"
+        f"🧾 رقم العملية: <code>{dep_row['tx_number']}</code>\n"
+        f"📱 طريقة الشحن: {method}"
+    )
+
+    bot.send_message(
+        ola_chat_id,
+        text,
+        reply_markup=admin_deposit_keyboard(dep_id),
+    )
+    return True
+
+
+def send_withdraw_request_to_ola276(w_id: int) -> bool:
+    """إرسال طلب سحب الرصيد من البوت إلى المشرف الرئيسي Ola276."""
+    w_row = get_bot_withdraw_request(w_id)
+    if not w_row:
+        return False
+
+    ola_chat_id = get_ola276_chat_id()
+    if not ola_chat_id:
+        print(f"Pending withdraw request #{w_id}: waiting for @{ADMIN_USERNAME} to message the bot once.")
+        return False
+
+    user_row = get_user_row_by_id(int(w_row["user_id"]))
+    uname_display = f"@{user_row['username']}" if user_row and user_row["username"] else (
+        user_row["first_name"] if user_row and user_row["first_name"] else "غير محدد"
+    )
+    current_balance = float(user_row["balance"]) if user_row else 0.0
+    method = str(w_row["method"])
+    amount = float(w_row["amount"])
+    commission = float(w_row["commission"])
+    net_amount = float(w_row["net_amount"])
+    wdr_usd_rate = get_withdraw_usd_rate_syp()
+    comm_pct = int(round(get_withdraw_commission_rate() * 100))
+
+    status_ar = {
+        "pending": "قيد المراجعة",
+        "approved": "تمت الموافقة",
+        "rejected": "مرفوض",
+    }.get(w_row["status"], w_row["status"])
+
+    if method == "شام كاش دولار 💲":
+        net_line = (
+            f"✅ صافي المبلغ بعد خصم العمولة: <b>{format_amount(net_amount)} USD</b> "
+            f"(سعر الصرف: {format_amount(wdr_usd_rate)} SYP = 1 USD)"
         )
-        await message.answer(result_text, reply_markup=back_kb)
-        
-    await state.clear()
-
-
-# ========================================================
-# === قسم إدارة المشرفين الثانويين ===
-# ========================================================
-@dp.callback_query(F.data == "adm_manage_secondary")
-async def cb_adm_manage_secondary(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if user_id != ADMIN_ID:
-        await callback.answer("❌ عذراً، هذه الصلاحية مخصصة للمشرف الأساسي فقط!", show_alert=True)
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT admin_id FROM secondary_admins") as cur:
-            rows = await cur.fetchall()
-
-    secondary_list = [r[0] for r in rows]
-    
-    text = "👥 **إدارة المشرفين الثانويين:**\n\n"
-    text += f"الحد الأقصى المسموح به: 3 مشرفين ثانويين\n"
-    text += f"المشرفين الثانويين الحاليين ({len(secondary_list)}/3):\n"
-    
-    if not secondary_list:
-        text += "• لا يوجد مشرفين ثانويين معينين حالياً.\n"
     else:
-        for idx, sec_id in enumerate(secondary_list, 1):
-            text += f"{idx}. الآيدي: `{sec_id}`\n"
+        net_line = f"✅ صافي المبلغ بعد خصم العمولة: <b>{format_amount(net_amount)} SYP</b>"
 
-    kb_buttons = []
-    if len(secondary_list) < 3:
-        kb_buttons.append([InlineKeyboardButton(text="➕ إضافة مشرف ثانوي", callback_data="adm_add_sec_prompt")])
-    
-    if secondary_list:
-        kb_buttons.append([InlineKeyboardButton(text="🗑️ حذف مشرف ثانوي", callback_data="adm_del_sec_list")])
-
-    kb_buttons.append([InlineKeyboardButton(text="رجوع لوحة المشرف 🔙", callback_data="adm_refresh")])
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "adm_add_sec_prompt")
-async def cb_adm_add_sec_prompt(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM secondary_admins") as cur:
-            count = (await cur.fetchone())[0]
-            if count >= 3:
-                await callback.answer("❌ لقد وصلت للحد الأقصى (3 مشرفين ثانويين)!", show_alert=True)
-                return
-
-    await state.set_state(AdminAddSecondaryStates.waiting_for_admin_id)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_manage_secondary")]])
-    await callback.message.edit_text(
-        "➕ **إضافة مشرف ثانوي جديد:**\n\nأرسل الآن (أيدي User ID) الخاص بالشخص الذي تريد تعيينه مشرفاً ثانوياً:",
-        reply_markup=back_kb
+    text = (
+        f"📤 <b>طلب سحب رصيد من البوت (#{w_row['id']})</b>\n"
+        f"الحالة: <b>{status_ar}</b>\n\n"
+        f"👤 اسم المشترك: {uname_display}\n"
+        f"🆔 آيدي المشترك: <code>{w_row['user_id']}</code>\n"
+        f"💰 رصيد البوت الحالي: <b>{format_amount(current_balance)} SYP</b>\n"
+        f"📱 طريقة السحب: {method}\n"
+        f"🎯 الرقم / الكود المرسل إليه: <code>{w_row['destination']}</code>\n"
+        f"💵 المبلغ المسحوب كامل: <b>{format_amount(amount)} SYP</b>\n"
+        f"📉 عمولة {comm_pct}%: <b>{format_amount(commission)} SYP</b>\n"
+        f"{net_line}"
     )
-    await callback.answer()
 
-
-@dp.message(AdminAddSecondaryStates.waiting_for_admin_id)
-async def process_add_secondary_admin(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if not message.text:
-        await message.answer("❌ يرجى إرسال أيدي صالح:")
-        return
-    try:
-        new_sec_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال أرقام صحيحة فقط للأيدي:")
-        return
-
-    if new_sec_id == ADMIN_ID:
-        await message.answer("❌ هذا هو أيدي المشرف الأساسي بالفعل!")
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM secondary_admins") as cur:
-            count = (await cur.fetchone())[0]
-            if count >= 3:
-                await message.answer("❌ عذراً، تم الوصول للحد الأقصى (3 مشرفين ثانويين).")
-                await state.clear()
-                return
-
-        async with db.execute("INSERT OR IGNORE INTO secondary_admins (admin_id) VALUES (?)", (new_sec_id,)) as cursor:
-            pass
-        await db.commit()
-
-    try:
-        await bot.send_message(new_sec_id, "🎉 تهانينا! تم تعيينك مشرفاً ثانوياً جديداً في البوت. يمكنك الآن استخدام أمر /admin للوصول للوحة التحكم.")
-    except Exception:
-        pass
-
-    await message.answer(f"✅ تم إضافة المشرف الثانوي (آيدي: `{new_sec_id}`) بنجاح!", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-@dp.callback_query(F.data == "adm_del_sec_list")
-async def cb_adm_del_sec_list(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT admin_id FROM secondary_admins") as cur:
-            rows = await cur.fetchall()
-
-    if not rows:
-        await callback.answer("لا يوجد مشرفين ثانويين للحذف.", show_alert=True)
-        return
-
-    kb_buttons = []
-    for r in rows:
-        s_id = r[0]
-        kb_buttons.append([InlineKeyboardButton(text=f"🗑️ حذف المشرف ({s_id})", callback_data=f"adm_rm_sec_{s_id}")])
-
-    kb_buttons.append([InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_manage_secondary")])
-    await callback.message.edit_text("🗑️ **اختر المشرف الثانوي المراد إزالته:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("adm_rm_sec_"))
-async def cb_adm_rm_sec(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    try:
-        sec_id = int(callback.data.split("_")[3])
-    except Exception:
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM secondary_admins WHERE admin_id = ?", (sec_id,))
-        await db.commit()
-
-    try:
-        await bot.send_message(sec_id, "⚠️ تم إزالتك من قائمة المشرفين الثانويين في البوت.")
-    except Exception:
-        pass
-
-    await callback.answer(f"✅ تم حذف المشرف الثانوي ({sec_id}) بنجاح.", show_alert=True)
-    
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT admin_id FROM secondary_admins") as cur:
-            rows = await cur.fetchall()
-
-    if not rows:
-        await callback.message.edit_text("👥 لا يوجد مشرفين ثانويين حالياً.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_manage_secondary")]]))
-        return
-
-    kb_buttons = []
-    for r in rows:
-        s_id = r[0]
-        kb_buttons.append([InlineKeyboardButton(text=f"🗑️ حذف المشرف ({s_id})", callback_data=f"adm_rm_sec_{s_id}")])
-    kb_buttons.append([InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_manage_secondary")])
-    await callback.message.edit_text("🗑️ **اختر المشرف الثانوي المراد إزالته:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
-
-
-# ========================================================
-# === قائمة إدارة رسائل سحب البوت ===
-# ========================================================
-@dp.callback_query(F.data == "adm_edit_wit_menu")
-async def cb_adm_edit_wit_menu(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="تعديل نص سحب سيريتل كاش 🪙", callback_data="edit_msg_wit_syr")],
-        [InlineKeyboardButton(text="تعديل نص سحب شام كاش سوري 💵", callback_data="edit_msg_wit_sham_syp")],
-        [InlineKeyboardButton(text="تعديل نص سحب شام كاش دولار 💲", callback_data="edit_msg_wit_sham_usd")],
-        [InlineKeyboardButton(text="رجوع لوحة المشرف 🔙", callback_data="adm_refresh")]
-    ])
-    await callback.message.edit_text("📝 **اختر وسيلة السحب التي تريد تعديل رسالتها:**", reply_markup=kb)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.in_({"edit_msg_wit_syr", "edit_msg_wit_sham_syp", "edit_msg_wit_sham_usd"}))
-async def cb_select_wit_msg_to_edit(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    key_map = {
-        "edit_msg_wit_syr": "msg_wit_syritel",
-        "edit_msg_wit_sham_syp": "msg_wit_sham_syp",
-        "edit_msg_wit_sham_usd": "msg_wit_sham_usd"
-    }
-    setting_key = key_map.get(callback.data)
-    await state.update_data(editing_wit_key=setting_key)
-    await state.set_state(AdminEditWithdrawMsgStates.waiting_for_text)
-
-    current_text = await fetch_setting(setting_key)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_edit_wit_menu")]])
-    
-    await callback.message.edit_text(
-        f"✏️ **تعديل نص رسالة السحب الحالي:**\n\n{current_text}\n\nأرسل النص الجديد الآن:",
-        reply_markup=back_kb
+    bot.send_message(
+        ola_chat_id,
+        text,
+        reply_markup=admin_withdraw_keyboard(w_id),
     )
-    await callback.answer()
+    return True
 
 
-@dp.message(AdminEditWithdrawMsgStates.waiting_for_text)
-async def process_edited_wit_msg_text(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    if not message.text:
-        await message.answer("❌ يرجى إرسال نص صالح:")
-        return
+def send_account_transfer_request_to_ola276(tr_id: int) -> bool:
+    """إرسال طلب شحن أو سحب رصيد في الحساب إلى المشرف الرئيسي Ola276."""
+    tr_row = get_account_transfer_request(tr_id)
+    if not tr_row:
+        return False
 
-    data = await state.get_data()
-    key = data.get("editing_wit_key")
-    new_text = message.text.strip()
+    ola_chat_id = get_ola276_chat_id()
+    if not ola_chat_id:
+        print(f"Pending account transfer request #{tr_id}: waiting for @{ADMIN_USERNAME} to message the bot once.")
+        return False
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, new_text))
-        await db.commit()
-
-    await message.answer("✅ تم تحديث نص رسالة السحب بنجاح!", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-# ========================================================
-# === قائمة إدارة رسائل وصور شحن البوت ===
-# ========================================================
-@dp.callback_query(F.data == "adm_edit_dep_menu")
-async def cb_adm_edit_dep_menu(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="تعديل نص سيريتل كاش 🪙", callback_data="edit_msg_syritel")],
-        [InlineKeyboardButton(text="🖼️ تغيير صورة سيريتل كاش", callback_data="edit_img_syritel")],
-        [InlineKeyboardButton(text="تعديل نص شام كاش سوري 💵", callback_data="edit_msg_sham_syp")],
-        [InlineKeyboardButton(text="🖼️ تغيير صورة شام كاش سوري", callback_data="edit_img_sham_syp")],
-        [InlineKeyboardButton(text="تعديل نص شام كاش دولار 💲", callback_data="edit_msg_sham_usd")],
-        [InlineKeyboardButton(text="🖼️ تغيير صورة شام كاش دولار", callback_data="edit_img_sham_usd")],
-        [InlineKeyboardButton(text="رجوع لوحة المشرف 🔙", callback_data="adm_refresh")]
-    ])
-    await callback.message.edit_text("📝 **اختر ما تريد تعديله لعمليات شحن البوت:**", reply_markup=kb)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.in_({"edit_msg_syritel", "edit_msg_sham_syp", "edit_msg_sham_usd"}))
-async def cb_select_msg_to_edit(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    key_map = {
-        "edit_msg_syritel": "msg_dep_syritel",
-        "edit_msg_sham_syp": "msg_dep_sham_syp",
-        "edit_msg_sham_usd": "msg_dep_sham_usd"
-    }
-    setting_key = key_map.get(callback.data)
-    await state.update_data(editing_key=setting_key)
-    await state.set_state(AdminEditMsgStates.waiting_for_text)
-
-    current_text = await fetch_setting(setting_key)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_edit_dep_menu")]])
-    
-    await callback.message.edit_text(
-        f"✏️ **تعديل نص الرسالة الحالي:**\n\n{current_text}\n\nأرسل النص الجديد الآن:",
-        reply_markup=back_kb
+    user_row = get_user_row_by_id(int(tr_row["user_id"]))
+    uname_display = f"@{user_row['username']}" if user_row and user_row["username"] else (
+        user_row["first_name"] if user_row and user_row["first_name"] else "غير محدد"
     )
-    await callback.answer()
+    current_balance = float(user_row["balance"]) if user_row else 0.0
+    transfer_type = str(tr_row["transfer_type"])
+    amount = float(tr_row["amount"])
 
+    status_ar = {
+        "pending": "قيد المراجعة",
+        "approved": "تمت الموافقة",
+        "rejected": "مرفوض",
+    }.get(tr_row["status"], tr_row["status"])
 
-@dp.message(AdminEditMsgStates.waiting_for_text)
-async def process_edited_msg_text(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    if not message.text:
-        await message.answer("❌ يرجى إرسال نص صالح:")
-        return
+    if transfer_type == "deposit_acc":
+        text = (
+            f"🔽 <b>طلب شحن رصيد في الحساب من رصيد البوت (#{tr_row['id']})</b>\n"
+            f"الحالة: <b>{status_ar}</b>\n\n"
+            f"👤 اسم المشترك: {uname_display}\n"
+            f"🆔 آيدي المشترك: <code>{tr_row['user_id']}</code>\n"
+            f"🏦 حساب ichancy: <code>{tr_row['acc_username']}</code>\n"
+            f"💰 رصيد البوت الحالي: <b>{format_amount(current_balance)} SYP</b>\n"
+            f"💵 المبلغ المراد شحنه في الحساب: <b>{format_amount(amount)} SYP</b>"
+        )
+    else:
+        text = (
+            f"🔼 <b>طلب سحب رصيد من الحساب إلى رصيد البوت (#{tr_row['id']})</b>\n"
+            f"الحالة: <b>{status_ar}</b>\n\n"
+            f"👤 اسم المشترك: {uname_display}\n"
+            f"🆔 آيدي المشترك: <code>{tr_row['user_id']}</code>\n"
+            f"🏦 حساب ichancy: <code>{tr_row['acc_username']}</code>\n"
+            f"💰 رصيد البوت الحالي: <b>{format_amount(current_balance)} SYP</b>\n"
+            f"💵 المبلغ المراد سحبه من الحساب: <b>{format_amount(amount)} SYP</b>"
+        )
 
-    data = await state.get_data()
-    key = data.get("editing_key")
-    new_text = message.text.strip()
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, new_text))
-        await db.commit()
-
-    await message.answer("✅ تم تحديث نص رسالة الشحن بنجاح!", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-@dp.callback_query(F.data.in_({"edit_img_syritel", "edit_img_sham_syp", "edit_img_sham_usd"}))
-async def cb_select_img_to_edit(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    img_map = {
-        "edit_img_syritel": DEFAULT_SYRITEL_QR,
-        "edit_img_sham_syp": DEFAULT_SHAM_SYP_QR,
-        "edit_img_sham_usd": DEFAULT_SHAM_USD_QR
-    }
-    target_path = img_map.get(callback.data)
-    await state.update_data(target_img_path=target_path)
-    await state.set_state(AdminEditDepositPhotoStates.waiting_for_photo)
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_edit_dep_menu")]])
-    await callback.message.edit_text(
-        "🖼️ **تغيير صورة شحن الحساب:**\n\nأرسل الآن الصورة الجديدة (أو الباركود) ليتم اعتمادها فوراً مع رسالة الشحن:",
-        reply_markup=back_kb
+    bot.send_message(
+        ola_chat_id,
+        text,
+        reply_markup=admin_account_transfer_keyboard(tr_id),
     )
-    await callback.answer()
+    return True
 
 
-@dp.message(AdminEditDepositPhotoStates.waiting_for_photo, F.photo)
-async def process_new_deposit_photo(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
+def flush_pending_requests_to_ola276():
+    """عند تفاعل Ola276، إرسال أي طلبات معلقة إليه."""
+    ola_chat_id = get_ola276_chat_id()
+    if not ola_chat_id:
         return
-    data = await state.get_data()
-    path = data.get("target_img_path", DEFAULT_SHAM_SYP_QR)
-    try:
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
-        downloaded_file = await bot.download_file(file_info.file_path)
-        
-        with open(path, "wb") as f:
-            f.write(downloaded_file.read())
+    with get_connection() as conn:
+        pending_acc = conn.execute(
+            "SELECT id FROM account_requests WHERE status = 'pending' ORDER BY id ASC"
+        ).fetchall()
+        pending_dep = conn.execute(
+            "SELECT id FROM bot_deposit_requests WHERE status = 'pending' ORDER BY id ASC"
+        ).fetchall()
+        pending_wdr = conn.execute(
+            "SELECT id FROM bot_withdraw_requests WHERE status = 'pending' ORDER BY id ASC"
+        ).fetchall()
+        pending_tr = conn.execute(
+            "SELECT id FROM account_transfer_requests WHERE status = 'pending' ORDER BY id ASC"
+        ).fetchall()
 
-        await message.answer("✅ تم تحديث صورة وسيلة الشحن بنجاح وتطبيقها للمشتركين!", reply_markup=get_admin_panel_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ حدث خطأ أثناء حفظ الصورة: {e}", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-@dp.message(AdminEditDepositPhotoStates.waiting_for_photo)
-async def process_new_deposit_photo_invalid(message: types.Message):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    await message.answer("❌ يرجى إرسال صورة صحيحة:")
-
-
-# ========================================================
-# === تعديل اسم البوت وصورة البوت ===
-# ========================================================
-@dp.callback_query(F.data == "adm_change_name")
-async def cb_adm_change_name(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    await state.set_state(AdminBotNameStates.waiting_for_name)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_refresh")]])
-    await callback.message.edit_text(
-        "✏️ **تغيير اسم البوت:**\n\nأرسل الآن الاسم الجديد الذي تريد عرضه للبوت:",
-        reply_markup=back_kb
-    )
-    await callback.answer()
-
-
-@dp.message(AdminBotNameStates.waiting_for_name)
-async def process_new_bot_name(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    if not message.text:
-        await message.answer("❌ يرجى إرسال اسم صالح:")
-        return
-    new_name = message.text.strip()
-    try:
-        await bot.set_my_name(new_name)
-        await message.answer(f"✅ تم تغيير اسم البوت بنجاح إلى:\n`{new_name}`", reply_markup=get_admin_panel_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ حدث خطأ أثناء تغيير اسم البوت عبر تيليجرام:\n{e}", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-@dp.callback_query(F.data == "adm_change_photo")
-async def cb_adm_change_photo(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    await state.set_state(AdminBotPhotoStates.waiting_for_photo)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_refresh")]])
-    await callback.message.edit_text(
-        "🖼️ **تغيير الصورة الشخصية للبوت:**\n\nأرسل الآن الصورة الجديدة لتحديث الرمز:",
-        reply_markup=back_kb
-    )
-    await callback.answer()
-
-
-@dp.message(AdminBotPhotoStates.waiting_for_photo, F.photo)
-async def process_new_bot_photo(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    try:
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
-        downloaded_file = await bot.download_file(file_info.file_path)
-        with open("bot_avatar.jpg", "wb") as f:
-            f.write(downloaded_file.read())
-        await message.answer("✅ تم استقبال وصور البوت بنجاح وحفظها محلياً!", reply_markup=get_admin_panel_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ حدث خطأ أثناء حفظ الصورة: {e}", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-@dp.message(AdminBotPhotoStates.waiting_for_photo)
-async def process_new_bot_photo_invalid(message: types.Message):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    await message.answer("❌ يرجى إرسال صورة صحيحة:")
-
-
-# ========================================================
-# === زر العروض النشطة للمشتركين ===
-# ========================================================
-@dp.callback_query(F.data == "bot_offers")
-async def cb_bot_offers(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    offers_text = await fetch_setting("active_offers_message")
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع للوحة 🔙", callback_data="back_to_dashboard")]])
-    try:
-        await callback.message.edit_text(offers_text, reply_markup=back_kb)
-    except Exception:
-        await callback.message.answer(offers_text, reply_markup=back_kb)
-    await callback.answer()
-
-
-# ========================================================
-# === زر استرداد آخر طلب سحب للمشترك (مع إعادة الإجمالي) ===
-# ========================================================
-@dp.callback_query(F.data == "restore_withdraw")
-async def cb_restore_withdraw(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT id, amount, admin_msg_id FROM pending_bot_withdraws WHERE user_id = ?", (user_id,)) as cur:
-            row = await cur.fetchone()
-
-    if not row:
-        await callback.answer("❌ ليس لديك أي طلب سحب معلق ليتم استرداده.", show_alert=True)
-        return
-
-    wit_id, amount, admin_msg_id = row
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE wallets SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-        await db.execute("DELETE FROM pending_bot_withdraws WHERE user_id = ?", (user_id,))
-        await db.commit()
-
-    if admin_msg_id:
+    for row in pending_acc:
         try:
-            admins = await get_all_admins()
-            for adm_id in admins:
-                try:
-                    await bot.delete_message(chat_id=adm_id, message_id=admin_msg_id)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            send_request_to_ola276(int(row["id"]))
+        except Exception as exc:
+            print(f"Failed sending pending account request #{row['id']}: {exc}")
 
-    new_balance = await get_user_balance(user_id)
-    await callback.answer(f"✅ تم إلغاء طلب السحب واسترداد مبلغ {amount} SYP إلى رصيدك بالكامل بنجاح!", show_alert=True)
-    
-    try:
-        await callback.message.edit_text(
-            f"♻️ **تم استرداد طلب السحب بنجاح:**\n\n"
-            f"🔢 رقم عملية السحب الملغاة: `#{wit_id}`\n"
-            f"💵 المبلغ المسترد بالكامل: `{amount}` SYP\n"
-            f"💳 رصيدك الحالي في البوت: `{new_balance}` SYP",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="القائمة الرئيسية 🏠", callback_data="back_to_dashboard")]])
+    for row in pending_dep:
+        try:
+            send_deposit_request_to_ola276(int(row["id"]))
+        except Exception as exc:
+            print(f"Failed sending pending deposit request #{row['id']}: {exc}")
+
+    for row in pending_wdr:
+        try:
+            send_withdraw_request_to_ola276(int(row["id"]))
+        except Exception as exc:
+            print(f"Failed sending pending withdraw request #{row['id']}: {exc}")
+
+    for row in pending_tr:
+        try:
+            send_account_transfer_request_to_ola276(int(row["id"]))
+        except Exception as exc:
+            print(f"Failed sending pending account transfer request #{row['id']}: {exc}")
+
+
+def send_start_response(chat_id: int, user, remove_reply_kb: bool = False):
+    """تنفيذ منطق (أبدء) مع فحص الدخول الأول والاشتراك الإجباري."""
+    sync_ola276_identity(user)
+    first_time = is_first_time_user(user.id)
+    balance = ensure_user(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if is_main_admin(user):
+        flush_pending_requests_to_ola276()
+
+    if remove_reply_kb:
+        menu_hint = "أبدء / رصيدي / لوحة التحكم" if is_main_admin(user) else "أبدء / رصيدي"
+        bot.send_message(
+            chat_id,
+            f"تم تفعيل قائمة الشريط السفلي ({menu_hint}).",
+            reply_markup=ReplyKeyboardRemove(),
         )
-    except Exception:
-        pass
 
-
-# ========================================================
-# === تعديل رسالة العروض النشطة ===
-# ========================================================
-@dp.callback_query(F.data == "adm_edit_offers")
-async def cb_adm_edit_offers(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
+    if first_time:
+        send_force_sub_message(chat_id, is_new_user=True)
         return
-    current_text = await fetch_setting("active_offers_message")
-    await state.set_state(AdminOffersStates.waiting_for_text)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_refresh")]])
-    await callback.message.edit_text(
-        f"🎁 **تعديل رسالة العروض النشطة:**\n\n"
-        f"النص الحالي:\n{current_text}\n\n"
-        f"أرسل النص الجديد الآن لتحديثه:",
-        reply_markup=back_kb
+
+    if not is_user_subscribed(user.id):
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+
+    set_user_state(user.id, None, None)
+    bot.send_message(
+        chat_id,
+        build_start_profile_text(user, balance),
+        reply_markup=main_features_keyboard(),
     )
-    await callback.answer()
 
 
-@dp.message(AdminOffersStates.waiting_for_text)
-async def process_new_offers_text(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
+def send_balance_response(chat_id: int, user):
+    """تنفيذ منطق (رصيدي) بعد التحقق من الاشتراك."""
+    sync_ola276_identity(user)
+    first_time = is_first_time_user(user.id)
+    balance = get_user_balance(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if is_main_admin(user):
+        flush_pending_requests_to_ola276()
+
+    if first_time:
+        send_force_sub_message(chat_id, is_new_user=True)
         return
-    if not message.text:
-        await message.answer("❌ يرجى إرسال نص صالح:")
+
+    if not is_user_subscribed(user.id):
+        send_force_sub_message(chat_id, is_new_user=False)
         return
-    new_text = message.text.strip()
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('active_offers_message', ?)", (new_text,))
-        await db.commit()
 
-    await message.answer("✅ تم تحديث رسالة العروض النشطة بنجاح!", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-# ========================================================
-# === قسم السجلات الخاصة بالمشترك ===
-# ========================================================
-@dp.callback_query(F.data == "bot_records")
-async def cb_bot_records(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT op_number, action_type, amount, currency, created_at FROM financial_logs WHERE user_id = ? ORDER BY id DESC LIMIT 20",
-            (user_id,)
-        ) as cur:
-            rows = await cur.fetchall()
-
-    text = "🗃️ **سجل عمليات السحب والإيداع الخاصة بك:**\n\n"
-    if not rows:
-        text += "لا توجد أي عمليات مالية مسجلة لحسابك حتى الآن."
-    else:
-        for r in rows:
-            op_num = r[0] or 1
-            act_name = "إيداع للبوت" if "deposit" in r[1] else "سحب من البوت"
-            text += f"🔹 رقم العملية: `#{op_num}` | النوع: {act_name} | القيمة: {r[2]} {r[3]} | التاريخ: {r[4]}\n"
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع للوحة 🔙", callback_data="back_to_dashboard")]])
-    try:
-        await callback.message.edit_text(text, reply_markup=back_kb)
-    except Exception:
-        await callback.message.answer(text, reply_markup=back_kb)
-    await callback.answer()
-
-
-# ========================================================
-# === قسم التواصل مع الدعم ===
-# ========================================================
-@dp.callback_query(F.data == "bot_support")
-async def cb_bot_support(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(SupportStates.waiting_for_message)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="back_to_dashboard")]])
-    await callback.message.edit_text(
-        "اكتب هنا او ارسل صوره سيتم ارسال رسالتك الى الاداره والرد في اقرب وقت ممكن 📩",
-        reply_markup=back_kb
+    bot.send_message(
+        chat_id,
+        f"💰 رصيدك الحالي في البوت: <b>{balance:.2f}</b>",
     )
-    await callback.answer()
 
 
-@dp.message(SupportStates.waiting_for_message)
-async def process_support_message(message: types.Message, state: FSMContext):
+@bot.message_handler(commands=["start"])
+def handle_start(message):
+    """معالجة خيار أبدء (/start)."""
+    send_start_response(message.chat.id, message.from_user, remove_reply_kb=True)
+
+
+@bot.message_handler(commands=["balance"])
+def handle_balance_command(message):
+    """معالجة خيار رصيدي (/balance)."""
+    send_balance_response(message.chat.id, message.from_user)
+
+
+@bot.message_handler(commands=["admin", "panel"])
+def handle_admin_command(message):
+    """فتح لوحة تحكم المشرف الرئيسي Ola276."""
     user = message.from_user
-    bot_balance = await get_user_balance(user.id)
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ رد على المشترك", callback_data=f"support_reply_{user.id}")]
-    ])
-
-    support_caption = (
-        f"📩 **رسالة دعم جديدة من مشترك:**\n\n"
-        f"👤 المشترك: @{user.username or 'بدون'} ({user.id})\n"
-        f"💳 رصيد المشترك الحالي في البوت: {bot_balance} SYP\n\n"
-        f"💬 النص: {message.text or message.caption or 'مرفق صورة'}"
-    )
-
-    try:
-        if message.photo:
-            await notify_next_admin(photo=message.photo[-1].file_id, text=support_caption, reply_markup=admin_kb)
-        else:
-            await notify_next_admin(text=support_caption, reply_markup=admin_kb)
-        
-        await message.answer("✅ تم إرسال رسالتك إلى الإدارة بنجاح وسيتم الرد عليك في أقرب وقت ممكن.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="القائمة الرئيسية 🏠", callback_data="back_to_dashboard")]]))
-    except Exception:
-        await message.answer("❌ حدث خطأ أثناء إرسال الرسالة للإدارة. حاول مجدداً.")
-
-    await state.clear()
-
-
-# ========================================================
-# === قسم الإحالات ===
-# ========================================================
-@dp.callback_query(F.data == "bot_referrals")
-async def cb_bot_referrals(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    bot_info = await bot.get_me()
-    bot_username = bot_info.username
-    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,)) as cur:
-            ref_count = (await cur.fetchone())[0]
-
-    payout_date = get_next_payout_date()
-
-    referral_text = (
-        "نظام احالات \n\n"
-        "يقدّم لك فرصة لدخل إضافي كل 10 أيام .\n"
-        "كن وكيلاً معنا بأبسط طريقة\n"
-        "إحصل على نسبة ثابتة لكل عمليات الشحن والتعبئة القادمة عن طريق رابط احالتك ضمن البوت \n"
-        ".....\n"
-        "1-عند الدخول الى البوت قم بنسخ رابط الاحالة الخاص بك عن طريق الضغط على خيار رابط الاحالة الخاص بي\n"
-        "2- عندما تقوم بنشر رابط احالتك ويقوم أحد بالتسجيل عن طريقة سنبدأ بحساب نسبة ثابتة لجميع عمليات السحب والتعبئة عن طريقك . \n"
-        "3-يمكن الاطلاع على عدد الاحالات التي قامت بالتسجيل من خلال الرابط الخاص بك عن طريق الضغط على خيار عدد الاحالات الخاصة بك خلال المسابقة الحالية \n"
-        "4- يتم حساب الارباح عند وجود 3 إحالات نشطة او أكثر\n"
-        "ماذا تنتظر...! \n"
-        "توزيع النسب كل 10 أيام\n\n"
-        f"عدد الاحالات التابعة لك: {ref_count}\n\n"
-        f"رابط الإحالة الخاص بك:\n{ref_link}\n\n"
-        f"الموعد القادم لتوزيع الاحالات:\n{payout_date}"
-    )
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="back_to_dashboard")]])
-    try:
-        await callback.message.edit_text(referral_text, reply_markup=back_kb)
-    except Exception:
-        await callback.message.answer(referral_text, reply_markup=back_kb)
-    await callback.answer()
-
-
-# ========================================================
-# === 1. زر إرسال رسالة وصورة للجميع (Broadcast مُحسن لـ 20k) ===
-# ========================================================
-@dp.callback_query(F.data == "adm_broadcast")
-async def cb_adm_broadcast(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
+    sync_ola276_identity(user)
+    setup_bottom_menu(message.chat.id, user=user)
+    if not is_main_admin(user):
+        bot.send_message(message.chat.id, "هذه اللوحة مخصصة للمشرف الرئيسي فقط.")
         return
-    await state.set_state(AdminBroadcastStates.waiting_for_content)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع للوحة المشرف 🔙", callback_data="adm_refresh")]])
-    await callback.message.edit_text(
-        "📢 إذاعة عامة للمشتركين (مُحسنة لـ 20 ألف مشترك):\n\nأرسل الآن الرسالة أو الصورة ليتم بثها تدريجياً وبشكل آمن:",
-        reply_markup=back_kb
+    set_user_state(user.id, None, None)
+    send_admin_panel(message.chat.id)
+
+
+# ==================== كولباكات لوحة تحكم المشرف ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_open_panel")
+def handle_adm_open_panel(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    setup_bottom_menu(call.message.chat.id, user=call.from_user)
+    set_user_state(call.from_user.id, None, None)
+    bot.answer_callback_query(call.id, "لوحة التحكم")
+    send_admin_panel(call.message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_stats")
+def handle_adm_stats(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    stats = get_bot_stats()
+    bot.answer_callback_query(call.id, "الإحصائيات")
+    bot.send_message(
+        call.message.chat.id,
+        f"📊 <b>إحصائيات البوت التفصيلية</b>\n\n"
+        f"👥 إجمالي المشتركين: <b>{stats['users_count']}</b>\n"
+        f"🏦 حسابات ichancy المفعلة: <b>{stats['acc_count']}</b>\n"
+        f"💰 مجموع أرصدة المشتركين في البوت: <b>{format_amount(stats['total_balance'])} SYP</b>\n"
+        f"📥 طلبات إنشاء حساب معلقة: <b>{stats['pending_acc']}</b>\n"
+        f"⬇️ طلبات شحن للبوت معلقة: <b>{stats['pending_dep']}</b>\n"
+        f"⬆️ طلبات سحب من البوت معلقة: <b>{stats['pending_wdr']}</b>\n"
+        f"🔄 طلبات شحن/سحب حساب معلقة: <b>{stats['pending_tr']}</b>\n"
+        f"📩 رسائل دعم مفتوحة: <b>{stats['open_tickets']}</b>",
+        reply_markup=admin_panel_keyboard(),
     )
-    await callback.answer()
 
 
-@dp.message(AdminBroadcastStates.waiting_for_content)
-async def process_broadcast_message(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
+@bot.callback_query_handler(func=lambda call: call.data == "adm_user_bal")
+def handle_adm_user_bal(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    set_user_state(call.from_user.id, "adm_waiting_user_query", None)
+    bot.answer_callback_query(call.id, "بحث عن مشترك")
+    bot.send_message(
+        call.message.chat.id,
+        "🔍 أرسل <b>آيدي المشترك</b> أو <b>معرفه (@username)</b> لعرض بياناته وتعديل رصيده:",
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_bal_op:"))
+def handle_adm_bal_op(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    _, op_type, target_id_str = call.data.split(":", 2)
+    target_id = int(target_id_str)
+    user_row = get_user_row_by_id(target_id)
+    if not user_row:
+        bot.answer_callback_query(call.id, "المشترك غير موجود.", show_alert=True)
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM users") as cur:
-            users = [row[0] for row in await cur.fetchall()]
+    set_user_state(call.from_user.id, f"adm_bal_amount_{op_type}", str(target_id))
+    op_ar = {"add": "إضافة مبلغ إلى رصيد", "sub": "خصم مبلغ من رصيد", "set": "تعيين رصيد جديد لـ"}.get(op_type, "تعديل")
+    bot.answer_callback_query(call.id, "أدخل المبلغ")
+    bot.send_message(
+        call.message.chat.id,
+        f"💵 أرسل المبلغ بالأرقام الإنجليزية لـ ({op_ar}) المشترك <code>{target_id}</code> (رصيده الحالي: <b>{format_amount(float(user_row['balance']))} SYP</b>):",
+        reply_markup=cancel_to_main_keyboard(),
+    )
 
-    sent_count = 0
-    fail_count = 0
-    total_users = len(users)
 
-    status_msg = await message.answer(f"⏳ جاري بدء الإذاعة لـ {total_users} مشترك بشكل آمن ومنتظم...")
+@bot.callback_query_handler(func=lambda call: call.data in {"adm_edit_btn_msg", "adm_edit_btn_photo"})
+def handle_adm_btn_picker(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    mode = "msg" if call.data == "adm_edit_btn_msg" else "photo"
+    title = "اختر الزر لتعديل رسالته ✍️:" if mode == "msg" else "اختر الزر لإضافة/تعديل صورته 🖼️:"
+    bot.answer_callback_query(call.id, "اختر الزر")
+    bot.send_message(
+        call.message.chat.id,
+        title,
+        reply_markup=admin_buttons_picker_keyboard(mode),
+    )
 
-    for index, uid in enumerate(users):
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_pick_"))
+def handle_adm_pick_button(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    prefix, btn_key = call.data.split(":", 1)
+    mode = prefix.replace("adm_pick_", "")
+    btn_label = BUTTON_KEY_TO_TITLE.get(btn_key, btn_key)
+    cfg = get_button_config(btn_key)
+    cur_msg = cfg["custom_message"] if (cfg and cfg["custom_message"]) else "(الرسالة الافتراضية)"
+    cur_photo = "موجودة ✅" if (cfg and cfg["photo_file_id"]) else "غير مضافة ❌"
+
+    if mode == "msg":
+        set_user_state(call.from_user.id, "adm_waiting_btn_msg", btn_key)
+        bot.answer_callback_query(call.id, "اكتب الرسالة الجديدة")
+        bot.send_message(
+            call.message.chat.id,
+            f"✍️ <b>تعديل رسالة الزر:</b> {btn_label}\n"
+            f"الرسالة الحالية: {cur_msg}\n\n"
+            "أرسل نص الرسالة الجديد الآن:",
+            reply_markup=admin_single_button_actions_keyboard(btn_key),
+        )
+    else:
+        set_user_state(call.from_user.id, "adm_waiting_btn_photo", btn_key)
+        bot.answer_callback_query(call.id, "أرسل الصورة")
+        bot.send_message(
+            call.message.chat.id,
+            f"🖼️ <b>إضافة / تغيير صورة الزر:</b> {btn_label}\n"
+            f"حالة الصورة الحالية: <b>{cur_photo}</b>\n\n"
+            "أرسل الصورة الآن (يمكن إرفاق وصف معها أو إرسالها كصورة فقط):",
+            reply_markup=admin_single_button_actions_keyboard(btn_key),
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_set_msg:"))
+def handle_adm_set_msg_btn(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    _, btn_key = call.data.split(":", 1)
+    set_user_state(call.from_user.id, "adm_waiting_btn_msg", btn_key)
+    bot.answer_callback_query(call.id, "أرسل نص الرسالة")
+    bot.send_message(
+        call.message.chat.id,
+        f"✍️ أرسل النص الجديد للزر <b>{BUTTON_KEY_TO_TITLE.get(btn_key, btn_key)}</b>:",
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_del_msg:"))
+def handle_adm_del_msg_btn(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    _, btn_key = call.data.split(":", 1)
+    save_button_message(btn_key, None)
+    set_user_state(call.from_user.id, None, None)
+    bot.answer_callback_query(call.id, "تم حذف الرسالة المخصصة ✅")
+    bot.send_message(
+        call.message.chat.id,
+        f"✅ تم حذف الرسالة المخصصة للزر <b>{BUTTON_KEY_TO_TITLE.get(btn_key, btn_key)}</b> والعودة للرسالة الافتراضية.",
+        reply_markup=admin_single_button_actions_keyboard(btn_key),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_set_photo:"))
+def handle_adm_set_photo_btn(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    _, btn_key = call.data.split(":", 1)
+    set_user_state(call.from_user.id, "adm_waiting_btn_photo", btn_key)
+    bot.answer_callback_query(call.id, "أرسل الصورة")
+    bot.send_message(
+        call.message.chat.id,
+        f"🖼️ أرسل الصورة المراد إرفاقها مع الزر <b>{BUTTON_KEY_TO_TITLE.get(btn_key, btn_key)}</b>:",
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_del_photo:"))
+def handle_adm_del_photo_btn(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    _, btn_key = call.data.split(":", 1)
+    save_button_photo(btn_key, None)
+    set_user_state(call.from_user.id, None, None)
+    bot.answer_callback_query(call.id, "تم حذف صورة الزر ✅")
+    bot.send_message(
+        call.message.chat.id,
+        f"✅ تم حذف الصورة المرفقة مع الزر <b>{BUTTON_KEY_TO_TITLE.get(btn_key, btn_key)}</b>.",
+        reply_markup=admin_single_button_actions_keyboard(btn_key),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_settings")
+def handle_adm_settings(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "الإعدادات")
+    bot.send_message(
+        call.message.chat.id,
+        "⚙️ <b>إعدادات البوت الحالية</b>\n\n"
+        f"📢 القناة: <code>{get_channel_username()}</code> ({get_channel_url()})\n"
+        f"📱 كود سيرياتيل: <code>{get_syriatel_code()}</code>\n"
+        f"💵 كود شام كاش سوري: <code>{get_sham_cash_syp_code()}</code>\n"
+        f"💲 كود شام كاش دولار: <code>{get_sham_cash_usd_code()}</code>\n"
+        f"💱 سعر صرف الشحن USD: <b>{format_amount(get_sham_cash_usd_rate_syp())} SYP</b>\n"
+        f"💱 سعر صرف السحب USD: <b>{format_amount(get_withdraw_usd_rate_syp())} SYP</b>\n"
+        f"📉 عمولة السحب: <b>{int(round(get_withdraw_commission_rate() * 100))}%</b>",
+        reply_markup=admin_settings_keyboard(),
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data in {
+        "adm_set_channel",
+        "adm_set_rates",
+        "adm_set_code_syr",
+        "adm_set_code_sham_syp",
+        "adm_set_code_sham_usd",
+        "adm_broadcast",
+    }
+)
+def handle_adm_setting_prompts(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+
+    prompts = {
+        "adm_set_channel": (
+            "adm_waiting_channel",
+            "📢 أرسل معرف القناة الجديد (مثال: <code>@ichancyadam</code>):",
+        ),
+        "adm_set_rates": (
+            "adm_waiting_rates",
+            "💱 أرسل القيم الثلاث مفصولة بمسافة أو سطر:\n"
+            "<code>سعر_صرف_الشحن_USD سعر_صرف_السحب_USD نسبة_العمولة_بالمئة</code>\n"
+            "مثال: <code>142 145 10</code>",
+        ),
+        "adm_set_code_syr": (
+            "adm_waiting_code_syr",
+            "📱 أرسل كود / رقم سيرياتيل كاش الجديد:",
+        ),
+        "adm_set_code_sham_syp": (
+            "adm_waiting_code_sham_syp",
+            "💵 أرسل كود شام كاش السوري الجديد:",
+        ),
+        "adm_set_code_sham_usd": (
+            "adm_waiting_code_sham_usd",
+            "💲 أرسل كود شام كاش الدولار الجديد:",
+        ),
+        "adm_broadcast": (
+            "adm_waiting_broadcast",
+            "📣 أرسل نص الرسالة الجماعية لإرسالها إلى جميع المشتركين:",
+        ),
+    }
+    next_state, prompt_msg = prompts[call.data]
+    set_user_state(call.from_user.id, next_state, None)
+    bot.answer_callback_query(call.id, "أدخل القيمة")
+    bot.send_message(call.message.chat.id, prompt_msg, reply_markup=cancel_to_main_keyboard())
+
+
+# ==================== بقية الكولباكات والأقسام ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "verify_sub")
+def handle_verify_subscription(call):
+    """التحقق من الاشتراك دون إرسال أي رسالة إضافية للمشترك بعد التأكيد."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    ensure_user(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "تم التحقق من اشتراكك بنجاح ✅")
         try:
-            if message.photo:
-                await bot.send_photo(chat_id=uid, photo=message.photo[-1].file_id, caption=message.caption or "")
-            else:
-                await bot.send_message(chat_id=uid, text=message.text)
-            sent_count += 1
+            bot.delete_message(chat_id=chat_id, message_id=call.message.message_id)
         except Exception:
-            fail_count += 1
-        
-        await asyncio.sleep(0.05)
+            pass
+    else:
+        bot.answer_callback_query(
+            call.id,
+            "لم يتم العثور على اشتراكك في القناة بعد.",
+            show_alert=True,
+        )
 
-        if index > 0 and index % 500 == 0:
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_main_menu")
+def handle_back_to_main_menu(call):
+    """إلغاء أي حالة حالية والعودة إلى القائمة الرئيسية."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    set_user_state(user.id, None, None)
+    bot.answer_callback_query(call.id, "القائمة الرئيسية")
+    send_main_menu_message(chat_id, user)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "support_cancel")
+def handle_support_cancel(call):
+    """إلغاء وضع التواصل مع الدعم والعودة للمشترك."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    set_user_state(user.id, None, None)
+    bot.answer_callback_query(call.id, "تم الإلغاء ❌")
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+    bot.send_message(chat_id, "تم إلغاء التواصل مع الدعم ❌")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "btn_logs")
+def handle_logs_button(call):
+    """عرض جميع عمليات الشحن إلى البوت والسحب من البوت منذ تاريخ إنشاء الحساب حتى وقت الطلب."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+
+    ensure_user(user)
+    set_user_state(user.id, None, None)
+    bot.answer_callback_query(call.id, "السجلات 🗃️")
+    send_custom_button_media_if_any(chat_id, "btn_logs")
+
+    ops = get_user_bot_operations_history(user.id)
+    now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    user_row = get_user_row_by_id(user.id)
+    since_date = user_row["created_at"] if user_row else now_utc
+
+    if not ops:
+        default_empty = (
+            f"🗃️ <b>سجل عمليات البوت</b>\n"
+            f"من تاريخ إنشاء الحساب: <code>{since_date}</code>\n"
+            f"حتى وقت الطلب: <code>{now_utc}</code>\n\n"
+            "لا توجد عمليات شحن إلى البوت أو سحب من البوت مسجلة حتى الآن."
+        )
+        bot.send_message(chat_id, get_custom_button_text("btn_logs", default_empty))
+        return
+
+    status_map = {
+        "pending": "قيد المراجعة ⏳",
+        "approved": "مقبولة ✅",
+        "rejected": "مرفوضة ❌",
+    }
+
+    lines = [
+        f"🗃️ <b>سجل عمليات البوت ({len(ops)})</b>",
+        f"منذ إنشاء الحساب: <code>{since_date}</code>",
+        f"حتى وقت الطلب: <code>{now_utc}</code>",
+        "────────────────────",
+    ]
+
+    for op in ops[:30]:
+        st_label = status_map.get(op["status"], op["status"])
+        if op["kind"] == "deposit":
+            lines.append(
+                f"⬇️ <b>شحن إلى البوت #{op['id']}</b> ({op['method']})\n"
+                f"💵 المبلغ: <b>{format_amount(op['amount'])}</b> | الحالة: <b>{st_label}</b>\n"
+                f"🕒 التاريخ: <code>{op['created_at']}</code>"
+            )
+        else:
+            unit = "USD" if op["method"] == "شام كاش دولار 💲" else "SYP"
+            lines.append(
+                f"⬆️ <b>سحب من البوت #{op['id']}</b> ({op['method']})\n"
+                f"💵 المبلغ: <b>{format_amount(op['amount'])} SYP</b> | الصافي: <b>{format_amount(op['net_amount'] or 0.0)} {unit}</b>\n"
+                f"📌 الحالة: <b>{st_label}</b> | 🕒 <code>{op['created_at']}</code>"
+            )
+
+    default_logs_text = "\n\n".join(lines)
+    bot.send_message(chat_id, get_custom_button_text("btn_logs", default_logs_text))
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "btn_support")
+def handle_support_button(call):
+    """بدء التواصل مع الدعم عند الضغط على زر التواصل مع الدعم 📩."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+
+    ensure_user(user)
+    set_user_state(user.id, "support_waiting_message", None)
+    bot.answer_callback_query(call.id, "التواصل مع الدعم")
+    send_custom_button_media_if_any(chat_id, "btn_support")
+    default_support_msg = (
+        "💬 التواصل مع الدعم\n\n"
+        "اكتب رسالتك أو أرسل صورة مع وصف وسنرد عليك في أقرب وقت:"
+    )
+    bot.send_message(
+        chat_id,
+        get_custom_button_text("btn_support", default_support_msg),
+        reply_markup=support_cancel_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sup_reply:"))
+def handle_admin_support_reply_button(call):
+    """تفعيل وضع الرد للمشرف Ola276 على رسالة دعم محددة."""
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "هذا الإجراء مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+
+    _, ticket_id_str = call.data.split(":", 1)
+    ticket_id = int(ticket_id_str)
+    ticket = get_support_ticket(ticket_id)
+    if not ticket:
+        bot.answer_callback_query(call.id, "رسالة الدعم غير موجودة.", show_alert=True)
+        return
+
+    set_user_state(call.from_user.id, "admin_replying_support", str(ticket_id))
+    bot.answer_callback_query(call.id, "أرسل ردك الآن")
+    bot.send_message(
+        call.from_user.id,
+        f"💬 أرسل الآن نص الرد أو صورة مع وصف لإرسالها للمشترك صاحب التذكرة #{ticket_id} (آيدي: <code>{ticket['user_id']}</code>):",
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "btn_deposit_acc")
+def handle_deposit_acc_button(call):
+    """بدء طلب شحن رصيد في الحساب من رصيد البوت عند الضغط على زر شحن رصيد في الحساب 🔽."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+
+    acc = get_active_ichancy_account(user.id)
+    if not acc:
+        set_user_state(user.id, None, None)
+        bot.answer_callback_query(call.id, "يجب إنشاء حساب أولاً", show_alert=True)
+        bot.send_message(
+            chat_id,
+            "لا يوجد لديك حساب ichancy مفعل بعد. يرجى إنشاء حساب أولاً من قسم ⚡ichancy ⚡.",
+            reply_markup=ichancy_menu_keyboard(),
+        )
+        return
+
+    ensure_user(user)
+    set_user_state(user.id, "acc_deposit_waiting_amount", None)
+    bot.answer_callback_query(call.id, "شحن رصيد في الحساب")
+    send_custom_button_media_if_any(chat_id, "btn_deposit_acc")
+
+    default_prompt = (
+        "أدخل المبلغ المراد شحنه  👇\n\n"
+        "يرجى الانتباه الى ضرورة إدخال الارقام باللغة الانكليزية فقط"
+    )
+    bot.send_message(
+        chat_id,
+        get_custom_button_text("btn_deposit_acc", default_prompt),
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "btn_withdraw_acc")
+def handle_withdraw_acc_button(call):
+    """بدء طلب سحب رصيد من الحساب إلى رصيد البوت عند الضغط على زر سحب رصيد من الحساب 🔼."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+
+    acc = get_active_ichancy_account(user.id)
+    if not acc:
+        set_user_state(user.id, None, None)
+        bot.answer_callback_query(call.id, "يجب إنشاء حساب أولاً", show_alert=True)
+        bot.send_message(
+            chat_id,
+            "لا يوجد لديك حساب ichancy مفعل بعد. يرجى إنشاء حساب أولاً من قسم ⚡ichancy ⚡.",
+            reply_markup=ichancy_menu_keyboard(),
+        )
+        return
+
+    ensure_user(user)
+    set_user_state(user.id, "acc_withdraw_waiting_amount", None)
+    bot.answer_callback_query(call.id, "سحب رصيد من الحساب")
+    send_custom_button_media_if_any(chat_id, "btn_withdraw_acc")
+
+    default_prompt = (
+        "أدخل المبلغ المراد سحبه  👇\n\n"
+        "يرجى الانتباه الى ضرورة إدخال الارقام باللغة الانكليزية فقط\n"
+        "اقل مبلغ للسحب SYP200"
+    )
+    bot.send_message(
+        chat_id,
+        get_custom_button_text("btn_withdraw_acc", default_prompt),
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("acc_tr_approve:", "acc_tr_reject:")))
+def handle_admin_account_transfer_actions(call):
+    """معالجة موافقة أو رفض طلب شحن أو سحب رصيد في الحساب من قِبل المشرف الرئيسي Ola276."""
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "هذا الإجراء مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+
+    action, tr_id_str = call.data.split(":", 1)
+    tr_id = int(tr_id_str)
+    tr_row = get_account_transfer_request(tr_id)
+
+    if not tr_row:
+        bot.answer_callback_query(call.id, "الطلب غير موجود.", show_alert=True)
+        return
+
+    target_user_id = int(tr_row["user_id"])
+    transfer_type = str(tr_row["transfer_type"])
+    amount = float(tr_row["amount"])
+    formatted_amount = format_amount(amount)
+
+    if action == "acc_tr_approve":
+        if transfer_type == "deposit_acc":
+            status_code, resulting_balance = approve_account_deposit_and_deduct_bot_balance(tr_id)
+            if status_code == "not_pending":
+                bot.answer_callback_query(call.id, "تمت معالجة هذا الطلب مسبقاً.", show_alert=True)
+                return
+            if status_code == "insufficient_balance":
+                bot.answer_callback_query(
+                    call.id,
+                    f"رصيد البوت غير كافٍ للخصم ({format_amount(resulting_balance)} SYP).",
+                    show_alert=True,
+                )
+                return
+
+            formatted_new_balance = format_amount(resulting_balance)
+            bot.answer_callback_query(call.id, "تمت الموافقة وخصم الرصيد من البوت ✅")
             try:
-                await status_msg.edit_text(f"⏳ جاري الإذاعة... تم إرسالها إلى ({index} / {total_users}) مشترك.")
+                bot.edit_message_reply_markup(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    reply_markup=None,
+                )
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=(
+                        call.message.html_text
+                        + f"\n\n✅ <b>تمت الموافقة وخصم {formatted_amount}SYP من رصيد البوت</b>"
+                        + f"\n💰 <b>رصيد البوت الجديد: {formatted_new_balance}SYP</b>"
+                    ),
+                )
             except Exception:
                 pass
 
-    await status_msg.edit_text(
-        f"✅ تمت الإذاعة العامة بنجاح تام!\n\n"
-        f"👥 إجمالي المستهدفين: {total_users}\n"
-        f"📨 عدد المستلمين بنجاح: {sent_count}\n"
-        f"❌ عدد الحسابات الوهمية أو المحظورة للبوت: {fail_count}"
+            bot.send_message(
+                target_user_id,
+                f"تم تحول مبلغ {formatted_amount}SYP بنجاح ✅\n"
+                f"رصيد البوت الجديد {formatted_new_balance}SYP",
+            )
+
+        else:
+            status_code, resulting_balance = approve_account_withdraw_and_add_bot_balance(tr_id)
+            if status_code == "not_pending":
+                bot.answer_callback_query(call.id, "تمت معالجة هذا الطلب مسبقاً.", show_alert=True)
+                return
+
+            formatted_new_balance = format_amount(resulting_balance)
+            bot.answer_callback_query(call.id, "تمت الموافقة وإضافة الرصيد إلى البوت ✅")
+            try:
+                bot.edit_message_reply_markup(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    reply_markup=None,
+                )
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=(
+                        call.message.html_text
+                        + f"\n\n✅ <b>تمت الموافقة وإضافة {formatted_amount}SYP إلى رصيد البوت</b>"
+                        + f"\n💰 <b>رصيد البوت الجديد: {formatted_new_balance}SYP</b>"
+                    ),
+                )
+            except Exception:
+                pass
+
+            bot.send_message(
+                target_user_id,
+                f"تم معالجة طلب السحب بنجاح ✅\n"
+                f"المبلغ المسحوب {formatted_amount}SYP\n"
+                f"رصيد البوت الجديد {formatted_new_balance}SYP",
+            )
+
+    elif action == "acc_tr_reject":
+        if tr_row["status"] != "pending":
+            bot.answer_callback_query(call.id, "تمت معالجة هذا الطلب مسبقاً.", show_alert=True)
+            return
+
+        set_account_transfer_status(tr_id, "rejected")
+        bot.answer_callback_query(call.id, "تم رفض الطلب ❌")
+        try:
+            bot.edit_message_reply_markup(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None,
+            )
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=call.message.html_text + "\n\n❌ <b>تم رفض الطلب</b>",
+            )
+        except Exception:
+            pass
+
+        if transfer_type == "deposit_acc":
+            bot.send_message(
+                target_user_id,
+                "يرجى المحاوله مره اخرى بعد قليل 🔴",
+            )
+        else:
+            bot.send_message(
+                target_user_id,
+                "يرجى محاولة السحب بعد قليل 🔴",
+            )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "btn_withdraw_bot")
+def handle_withdraw_bot_button(call):
+    """عرض طرق السحب المتاحة من البوت عند الضغط على زر سحب رصيد من البوت ⬆️."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+
+    ensure_user(user)
+    set_user_state(user.id, None, None)
+    bot.answer_callback_query(call.id, "طرق السحب")
+    send_custom_button_media_if_any(chat_id, "btn_withdraw_bot")
+    default_msg = "اختر طرق السحب المتاحه.👇"
+    bot.send_message(
+        chat_id,
+        get_custom_button_text("btn_withdraw_bot", default_msg),
+        reply_markup=bot_withdraw_methods_keyboard(),
     )
-    await state.clear()
 
 
-# ========================================================
-# === 2. زر تعديل رسالة الترحيب والشروط ===
-# ========================================================
-@dp.callback_query(F.data == "adm_edit_welcome")
-async def cb_adm_edit_welcome(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
+@bot.callback_query_handler(func=lambda call: call.data == "wdr_method_syriatel")
+def handle_withdraw_syriatel_method(call):
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
         return
-    current_text = await fetch_setting("welcome_message")
-    await state.set_state(AdminWelcomeStates.waiting_for_text)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_refresh")]])
-    await callback.message.edit_text(
-        f"✏️ تعديل رسالة الترحيب الحالية:\n\nالنص الحالي:\n{current_text}\n\nأرسل النص الجديد الآن لتبديله:",
-        reply_markup=back_kb
+    ensure_user(user)
+    set_user_state(user.id, "wdr_syriatel_waiting_phone", None)
+    bot.answer_callback_query(call.id, "سريتيل كاش")
+    bot.send_message(
+        chat_id,
+        "أدخل الرقم المراد التحويل اليه\n\n"
+        "الحد الادنى للسحب هو: SYP 250.00\n"
+        "الحد الاعلى للسحب هو: SYP 5,000,000.00",
+        reply_markup=cancel_to_main_keyboard(),
     )
-    await callback.answer()
 
 
-@dp.message(AdminWelcomeStates.waiting_for_text)
-async def process_new_welcome_text(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
+@bot.callback_query_handler(func=lambda call: call.data == "wdr_method_sham_syp")
+def handle_withdraw_sham_syp_method(call):
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
         return
-    if not message.text:
-        await message.answer("❌ يرجى إرسال نص صالح:")
-        return
-    new_text = message.text.strip()
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('welcome_message', ?)", (new_text,))
-        await db.commit()
-
-    await message.answer("✅ تم تحديث رسالة الترحيب بنجاح!", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-# ========================================================
-# === 3. زر التحكم بحالة البوت ===
-# ========================================================
-@dp.callback_query(F.data == "adm_toggle_bot")
-async def cb_adm_toggle_bot(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    current_status = await fetch_setting("bot_status")
-    new_status = "stopped" if current_status == "active" else "active"
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('bot_status', ?)", (new_status,))
-        await db.commit()
-
-    status_text = "🟢 البوت يعمل الآن بشكل طبيعي." if new_status == "active" else "🔴 تم إيقاف استقبال طلبات البوت مؤقتاً."
-    await callback.answer(status_text, show_alert=True)
-    try:
-        await callback.message.edit_reply_markup(reply_markup=get_admin_panel_keyboard())
-    except Exception:
-        pass
-
-
-# ========================================================
-# === 4. سجلات العمليات والإحصائيات ===
-# ========================================================
-@dp.callback_query(F.data.in_({"adm_log_bot_dep", "adm_log_bot_wit"}))
-async def cb_adm_financial_logs(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    action_filter = "bot_deposit" if callback.data == "adm_log_bot_dep" else "bot_withdraw"
-    title = "📥 سجل عمليات شحن البوت" if action_filter == "bot_deposit" else "📤 سجل عمليات سحب البوت"
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT op_number, user_id, amount, currency, created_at FROM financial_logs WHERE action_type = ? ORDER BY id DESC LIMIT 15",
-            (action_filter,)
-        ) as cur:
-            rows = await cur.fetchall()
-
-    log_text = f"📋 {title} (آخر 15 عملية):\n\n"
-    if not rows:
-        log_text += "لا توجد سجلات مالية حتى الآن."
-    else:
-        for r in rows:
-            op_num = r[0] or 1
-            log_text += f"🔢 رقم العملية: `#{op_num}` | المشترك: `{r[1]}` | 💵 القيمة: {r[2]} {r[3]} | 📅 التاريخ: {r[4]}\n"
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع للوحة التحكم 🔙", callback_data="adm_refresh")]])
-    try:
-        await callback.message.edit_text(log_text, reply_markup=back_kb)
-    except Exception:
-        await callback.message.answer(log_text, reply_markup=back_kb)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "adm_stats")
-async def cb_adm_stats(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    today_str = str(date.today())
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            total_users = (await cur.fetchone())[0]
-
-        async with db.execute("SELECT SUM(amount) FROM financial_logs WHERE action_type = 'bot_deposit' AND created_at = ?", (today_str,)) as cur:
-            row = await cur.fetchone()
-            today_dep = row[0] if row and row[0] else 0.0
-
-        async with db.execute("SELECT SUM(amount) FROM financial_logs WHERE action_type = 'bot_withdraw' AND created_at = ?", (today_str,)) as cur:
-            row = await cur.fetchone()
-            today_wit = row[0] if row and row[0] else 0.0
-
-    stats_text = (
-        f"📊 إحصائيات البوت الشاملة:\n\n"
-        f"👥 إجمالي عدد اللاعبين المشتركين: {total_users} مشترِك\n\n"
-        f"📅 إحصائيات اليوم ({today_str}):\n"
-        f"📥 إجمالي الإيداعات اليومية: {today_dep} SYP\n"
-        f"📤 إجمالي السحوبات اليومية: {today_wit} SYP"
+    ensure_user(user)
+    set_user_state(user.id, "wdr_sham_syp_waiting_code", None)
+    bot.answer_callback_query(call.id, "شام كاش سوري")
+    bot.send_message(
+        chat_id,
+        "ادخل كود الشام كاش الخاص بك\n\n"
+        "الحد الادنى للسحب هو: SYP 2,000.00",
+        reply_markup=cancel_to_main_keyboard(),
     )
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_refresh")]])
-    try:
-        await callback.message.edit_text(stats_text, reply_markup=back_kb)
-    except Exception:
-        await callback.message.answer(stats_text, reply_markup=back_kb)
-    await callback.answer()
 
 
-@dp.callback_query(F.data == "adm_monthly_log")
-async def cb_adm_monthly_log(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
+@bot.callback_query_handler(func=lambda call: call.data == "wdr_method_sham_usd")
+def handle_withdraw_sham_usd_method(call):
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
         return
-    await state.set_state(AdminDailyStatsStates.waiting_for_date)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_refresh")]])
-    try:
-        await callback.message.edit_text(
-            "📅 السجل الشهري المخصص:\n\nأدخل التاريخ بالصيغة التالية (السنة-الشهر-اليوم) مثال: 2026-11-16 لعرض تفاصيل الإيداع والسحب لذلك اليوم:",
-            reply_markup=back_kb
-        )
-    except Exception:
-        pass
-    await callback.answer()
+    ensure_user(user)
+    set_user_state(user.id, "wdr_sham_usd_waiting_code", None)
+    bot.answer_callback_query(call.id, "شام كاش دولار")
+    bot.send_message(
+        chat_id,
+        "ادخل كود الشام كاش الخاص بك\n\n"
+        "الحد الادنى للسحب هو: SYP 2,000.00",
+        reply_markup=cancel_to_main_keyboard(),
+    )
 
 
-@dp.message(AdminDailyStatsStates.waiting_for_date)
-async def process_monthly_log_date(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
+@bot.callback_query_handler(func=lambda call: call.data == "wdr_method_bemo")
+def handle_disabled_withdraw_methods(call):
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
         return
-    if not message.text:
-        await message.answer("❌ يرجى إدخال تاريخ صالح:")
-        return
-    target_date = message.text.strip()
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT action_type, SUM(amount), currency FROM financial_logs WHERE created_at = ? GROUP BY action_type, currency", (target_date,)) as cur:
-            rows = await cur.fetchall()
-
-    result_text = f"📅 تقرير يوم: {target_date}\n\n"
-    if not rows:
-        result_text += "لا توجد أي تحويلات مالية مسجلة في هذا التاريخ."
-    else:
-        for r in rows:
-            act_name = "شحن البوت / إيداع" if r[0] == "bot_deposit" else "سحب البوت"
-            result_text += f"🔹 {act_name}: {r[1]} {r[2]}\n"
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="لوحة التحكم الرئيسية 🔙", callback_data="adm_refresh")]])
-    await message.answer(result_text, reply_markup=back_kb)
-    await state.clear()
+    set_user_state(user.id, None, None)
+    bot.answer_callback_query(call.id, "الخدمة متوقفه حاليا ⚙️")
+    bot.send_message(
+        chat_id,
+        "الخدمة متوقفه حاليا ⚙️",
+        reply_markup=bot_withdraw_methods_keyboard(),
+    )
 
 
-# ========================================================
-# === 5. زر إدارة المشتركين ===
-# ========================================================
-@dp.callback_query(F.data == "adm_manage_users")
-async def cb_adm_manage_users(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if not await is_admin(user_id):
-        return
-    await state.set_state(AdminManageUserStates.waiting_for_user_id)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع 🔙", callback_data="adm_refresh")]])
-    try:
-        await callback.message.edit_text(
-            "👤 إدارة المشتركين:\n\nأدخل أيدي (User ID) المشترك المراد التحكم به:",
-            reply_markup=back_kb
-        )
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(AdminManageUserStates.waiting_for_user_id)
-async def process_manage_user_id(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not await is_admin(user_id):
-        return
-    if not message.text:
-        await message.answer("❌ يرجى إدخال أيدي صحيح:")
-        return
-    try:
-        target_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال أيدي صحيح (أرقام فقط):")
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("wdr_approve:", "wdr_reject:")))
+def handle_admin_withdraw_actions(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "هذا الإجراء مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT balance FROM wallets WHERE user_id = ?", (target_id,)) as cur:
-            w_row = await cur.fetchone()
-        async with db.execute("SELECT ichancy_username, ichancy_password FROM ichancy_accounts WHERE user_id = ?", (target_id,)) as cur:
-            acc_row = await cur.fetchone()
+    action, w_id_str = call.data.split(":", 1)
+    w_id = int(w_id_str)
+    w_row = get_bot_withdraw_request(w_id)
 
     if not w_row:
-        await message.answer("❌ عذراً، هذا المستخدم غير مسجل في قاعدة بيانات البوت.")
-        await state.clear()
+        bot.answer_callback_query(call.id, "طلب السحب غير موجود.", show_alert=True)
         return
 
-    balance = w_row[0]
-    acc_info = f"اسم المستخدم: {acc_row[0]}" if acc_row else "لا يملك حساب ichancy مفعّل"
+    target_user_id = int(w_row["user_id"])
+    amount = float(w_row["amount"])
+    method = str(w_row["method"])
 
-    await state.update_data(target_user_id=target_id)
+    if action == "wdr_approve":
+        status_code, resulting_balance = approve_withdraw_and_deduct_balance(w_id)
+        if status_code == "not_pending":
+            bot.answer_callback_query(call.id, "تمت معالجة هذا الطلب مسبقاً.", show_alert=True)
+            return
+        if status_code == "insufficient_balance":
+            bot.answer_callback_query(
+                call.id,
+                f"رصيد المشترك غير كافٍ للخصم ({format_amount(resulting_balance)} SYP).",
+                show_alert=True,
+            )
+            return
 
-    manage_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 تعديل رصيد المشترك في البوت", callback_data=f"adm_set_bal_{target_id}")],
-        [InlineKeyboardButton(text="🗑️ حذف حساب المنصة المرتبط", callback_data=f"adm_del_acc_{target_id}")],
-        [InlineKeyboardButton(text="❌ حذف المشترك نهائياً من البوت", callback_data=f"adm_del_usr_{target_id}")],
-        [InlineKeyboardButton(text="رجوع للوحة التحكم 🔙", callback_data="adm_refresh")]
-    ])
-
-    await message.answer(
-        f"👤 معلومات المشترك ({target_id}):\n\n💳 رصيد البوت الحالي: {balance} SYP\n🏷️ حساب المنصة: {acc_info}\n\nاختر الإجراء المطلوب تنفيذه:",
-        reply_markup=manage_kb
-    )
-
-
-@dp.callback_query(F.data.startswith("adm_set_bal_"))
-async def cb_adm_set_balance_prompt(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        return
-    uid = int(callback.data.split("_")[3])
-    await state.update_data(target_user_id=uid)
-    await state.set_state(AdminManageUserStates.waiting_for_new_balance)
-    await callback.message.answer(f"أدخل المبلغ الجديد لرصيد المشترك ({uid}):")
-    await callback.answer()
-
-
-@dp.message(AdminManageUserStates.waiting_for_new_balance)
-async def process_new_user_balance(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
-    if not message.text:
-        await message.answer("❌ يرجى إدخال مبلغ صحيح:")
-        return
-    try:
-        new_bal = float(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال رقم صحيح:")
-        return
-
-    data = await state.get_data()
-    uid = data.get("target_user_id")
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE wallets SET balance = ? WHERE user_id = ?", (new_bal, uid))
-        await db.commit()
-
-    await message.answer(f"✅ تم تحديث رصيد المشترك ({uid}) ليصبح: {new_bal} SYP", reply_markup=get_admin_panel_keyboard())
-    await state.clear()
-
-
-@dp.callback_query(F.data.startswith("adm_del_acc_"))
-async def cb_adm_delete_account(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not await is_admin(callback.from_user.id):
-        return
-    uid = int(callback.data.split("_")[3])
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM ichancy_accounts WHERE user_id = ?", (uid,))
-        await db.commit()
-    await callback.answer(f"✅ تم حذف حساب المنصة للمشترك {uid} بنجاح.", show_alert=True)
-
-
-@dp.callback_query(F.data.startswith("adm_del_usr_"))
-async def cb_adm_delete_user(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not await is_admin(callback.from_user.id):
-        return
-    uid = int(callback.data.split("_")[3])
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
-        await db.execute("DELETE FROM wallets WHERE user_id = ?", (uid,))
-        await db.execute("DELETE FROM ichancy_accounts WHERE user_id = ?", (uid,))
-        await db.commit()
-    await callback.answer(f"✅ تم حذف المشترك {uid} من البوت نهائياً.", show_alert=True)
-
-
-# ========================================================
-# === سحب رصيد من الحساب 🔼 ===
-# ========================================================
-@dp.callback_query(F.data == "acc_withdraw")
-async def cb_acc_withdraw_start(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT ichancy_username FROM ichancy_accounts WHERE user_id = ?", (user_id,)) as cur:
-            if not await cur.fetchone():
-                await callback.answer("❌ يجب عليك إنشاء حساب ichancy أولاً.", show_alert=True)
-                return
-
-        async with db.execute("SELECT amount FROM pending_acc_withdraws WHERE user_id = ?", (user_id,)) as cur:
-            if await cur.fetchone():
-                await callback.answer("⚠️ لديك طلب سحب رصيد من الحساب قيد المراجعة لدى الإدارة بالفعل!", show_alert=True)
-                return
-
-    await state.set_state(AccountWithdrawStates.waiting_for_amount)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع ♻️", callback_data="back_to_dashboard")]])
-    
-    text = "ادخل المبلغ المراد سحبه من حسابك 👇"
-    try:
-        await callback.message.edit_text(text, reply_markup=back_kb)
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(AccountWithdrawStates.waiting_for_amount)
-async def process_acc_withdraw_amount(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال مبلغ صالح:")
-        return
-    try:
-        amount = float(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال رقم صحيح للمبلغ المراد سحبه:")
-        return
-
-    if amount < 200.0:
-        await message.answer("❌ الحد الأدنى لسحب رصيد الحساب هو 200 SYP. يرجى إدخال مبلغ صالح:")
-        return
-
-    user = message.from_user
-    bot_balance = await get_user_balance(user.id)
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO pending_acc_withdraws (user_id, amount) VALUES (?, ?)",
-            (user.id, amount)
+        bot.answer_callback_query(
+            call.id,
+            f"تمت الموافقة وخصم {format_amount(amount)} SYP من رصيد البوت ✅",
         )
-        await db.commit()
+        try:
+            bot.edit_message_reply_markup(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None,
+            )
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=(
+                    call.message.html_text
+                    + f"\n\n✅ <b>تمت الموافقة وخصم {format_amount(amount)} SYP من رصيد البوت</b>"
+                    + f"\n💰 <b>رصيد البوت الجديد للمشترك: {format_amount(resulting_balance)} SYP</b>"
+                ),
+            )
+        except Exception:
+            pass
 
-    await message.answer("جاري السحب والاتصال بالخوادم .⏳")
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ موافقة", callback_data=f"aw_yes_{user.id}"),
-            InlineKeyboardButton(text="❌ رفض", callback_data=f"aw_no_{user.id}")
-        ]
-    ])
-
-    await notify_next_admin(
-        f"📥 طلب سحب رصيد من الحساب (إلى رصيد البوت):\n\n"
-        f"👤 المشترك: @{user.username or 'بدون'} ({user.id})\n"
-        f"💵 المبلغ المراد سحبه من حساب اللاعب: {amount} SYP\n"
-        f"💳 رصيد المشترك الحالي في البوت: {bot_balance} SYP",
-        reply_markup=admin_kb
-    )
-
-    await state.clear()
-
-
-@dp.callback_query(F.data.startswith("aw_yes_") | F.data.startswith("aw_no_"))
-async def admin_acc_withdraw_decision(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not await is_admin(callback.from_user.id):
-        return
-    data_parts = callback.data.split("_")
-    if len(data_parts) >= 3:
-        action = data_parts[1]
-        uid = int(data_parts[2])
-    else:
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT amount FROM pending_acc_withdraws WHERE user_id = ?", (uid,)) as cur:
-            row = await cur.fetchone()
-        
-        await db.execute("DELETE FROM pending_acc_withdraws WHERE user_id = ?", (uid,))
-        await db.commit()
-
-    if action == "yes":
-        if row:
-            amount = row[0]
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("INSERT OR IGNORE INTO wallets (user_id, balance) VALUES (?, 0.0)", (uid,))
-                await db.execute("UPDATE wallets SET balance = balance + ? WHERE user_id = ?", (amount, uid))
-                await db.commit()
-
-            await log_financial(1, uid, "bot_deposit", amount, "SYP")
-            new_balance = await get_user_balance(uid)
-
-            try:
-                await bot.send_message(
-                    uid,
-                    f"تم شحن حسابك بنجاح✅\n\nالمبلغ المشحون: {amount} SYP\nرصيد البوت الجديد: {new_balance} SYP"
-                )
-            except Exception:
-                pass
-            try:
-                await callback.message.edit_text(callback.message.text + "\n\n✅ تمت الموافقة وإضافة المبلغ إلى رصيد البوت للمشترك.")
-            except Exception:
-                pass
+        if method == "شام كاش دولار 💲":
+            bot.send_message(
+                target_user_id,
+                "تم الموافقه.على طلب السحب\n"
+                "سيتم تحويل الاموال في اقرب وقت ممكن ✅",
+            )
         else:
-            await callback.answer("❌ البيانات غير موجودة أو تم التعامل معها مسبقاً.", show_alert=True)
-    else:
+            bot.send_message(
+                target_user_id,
+                "تم الموافقه .على طلب السحب\n"
+                "سيتم ارسال الاموال في اقرب وقت ممكن ✅",
+            )
+
+    elif action == "wdr_reject":
+        if w_row["status"] != "pending":
+            bot.answer_callback_query(call.id, "تمت معالجة هذا الطلب مسبقاً.", show_alert=True)
+            return
+
+        set_bot_withdraw_status(w_id, "rejected")
+        bot.answer_callback_query(call.id, "تم رفض طلب السحب ❌")
         try:
-            await bot.send_message(uid, "تم رفض المعالجة لعدم توفر رصيد كافي 🔴")
+            bot.edit_message_reply_markup(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None,
+            )
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=call.message.html_text + "\n\n❌ <b>تم رفض الطلب</b>",
+            )
         except Exception:
             pass
-        try:
-            await callback.message.edit_text(callback.message.text + "\n\n❌ تم رفض الطلب من قبل الإدارة.")
-        except Exception:
-            pass
 
-    await callback.answer()
-
-
-# ========================================================
-# === سحب رصيد من البوت ⬆️ (مع احتساب واقتطاع العمولة تلقائياً) ===
-# ========================================================
-@dp.callback_query(F.data == "bot_withdraw")
-async def cb_bot_withdraw_menu(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    balance = await get_user_balance(user_id)
-
-    if balance <= 0:
-        await callback.answer("❌ عذراً، رصيدك الحالي في البوت فارغ (0 SYP) ولا يمكنك إجراء عملية سحب.", show_alert=True)
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM pending_bot_withdraws WHERE user_id = ?", (user_id,)) as cur:
-            if await cur.fetchone():
-                await callback.answer("⚠️ لديك طلب سحب معلق بالفعل! يمكنك إلغاؤه عبر زر 'استرداد آخر طلب سحب'.", show_alert=True)
-                return
-
-    await callback.message.edit_text(
-        "اختر احد طرق السحب المتاحه 👇",
-        reply_markup=get_bot_withdraw_methods_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.in_({"wit_syritel", "wit_sham_syp", "wit_sham_usd"}))
-async def cb_withdraw_method_selected(callback: types.CallbackQuery, state: FSMContext):
-    method_map = {
-        "wit_syritel": "سيريتل كاش 🪙",
-        "wit_sham_syp": "شام كاش سوري 💵",
-        "wit_sham_usd": "شام كاش دولار 💲"
-    }
-    key_setting_map = {
-        "wit_syritel": "msg_wit_syritel",
-        "wit_sham_syp": "msg_wit_sham_syp",
-        "wit_sham_usd": "msg_wit_sham_usd"
-    }
-    selected_method = method_map.get(callback.data)
-    setting_key = key_setting_map.get(callback.data)
-    
-    await state.update_data(withdraw_method=selected_method)
-    await state.set_state(BotWithdrawStates.waiting_for_amount)
-
-    user_id = callback.from_user.id
-    balance = await get_user_balance(user_id)
-
-    custom_msg = await fetch_setting(setting_key)
-    comm_rate = float(await fetch_setting("withdraw_commission") or 0)
-
-    text = (
-        f"{custom_msg}\n\n"
-        f"💳 رصيدك المتاح: {balance} SYP\n"
-        f"⚠️ نسبة عمولة السحب الحالية: {comm_rate}%\n\n"
-        f"أدخل المبلغ المراد سحبه 👇"
-    )
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع ♻️", callback_data="bot_withdraw")]])
-    try:
-        await callback.message.edit_text(text, reply_markup=back_kb)
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(BotWithdrawStates.waiting_for_amount)
-async def process_withdraw_amount(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال مبلغ صالح:")
-        return
-    try:
-        amount = float(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال رقم صحيح للمبلغ المراد سحبه:")
-        return
-
-    user_id = message.from_user.id
-    balance = await get_user_balance(user_id)
-
-    if amount <= 0:
-        await message.answer("❌ يجب أن يكون المبلغ أكبر من صفر:")
-        return
-
-    if amount > balance:
-        await message.answer(f"❌ عذراً، المبلغ المطلوب ({amount}) أكبر من رصيدك الحالي ({balance} SYP). أدخل مبلغاً مناسباً:")
-        return
-
-    await state.update_data(withdraw_amount=amount)
-    await state.set_state(BotWithdrawStates.waiting_for_details)
-    await message.answer("📝 أدخل معلومات وحساب الاستلام (مثل رقم الحساب أو رقم الهاتف):")
-
-
-@dp.message(BotWithdrawStates.waiting_for_details)
-async def process_withdraw_details(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال تفاصيل صالحة:")
-        return
-    details = message.text.strip()
-    data = await state.get_data()
-    amount = data.get("withdraw_amount")
-    method = data.get("withdraw_method")
-    user = message.from_user
-    bot_balance = await get_user_balance(user.id)
-
-    comm_rate = float(await fetch_setting("withdraw_commission") or 0)
-    commission = (amount * comm_rate) / 100.0
-    net_amount = amount - commission
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE wallets SET balance = balance - ? WHERE user_id = ?", (amount, user.id))
-        
-        cursor = await db.execute(
-            "INSERT INTO pending_bot_withdraws (user_id, method, amount, commission, net_amount, details) VALUES (?, ?, ?, ?, ?, ?)",
-            (user.id, method, amount, commission, net_amount, details)
-        )
-        wit_id = cursor.lastrowid
-        await db.commit()
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ موافقة", callback_data=f"bw_yes_{wit_id}"),
-            InlineKeyboardButton(text="❌ رفض", callback_data=f"bw_no_{wit_id}")
-        ]
-    ])
-
-    admin_text = (
-        f"📤 **طلب سحب رصيد بوت جديد (#`{wit_id}`):**\n\n"
-        f"👤 صاحب الطلب: @{user.username or 'بدون'} (`{user.id}`)\n"
-        f"💳 طريقة السحب: {method}\n"
-        f"💵 المبلغ المطلوب (الإجمالي): {amount} SYP\n"
-        f"📊 نسبة العمولة: {comm_rate}%\n"
-        f"✂️ قيمة العمولة المقتطعة: {commission} SYP\n"
-        f"💰 المبلغ الصافي (للمشترك): **{net_amount} SYP**\n"
-        f"💳 رصيد المشترك الحالي في البوت بعد الخصم: {bot_balance - amount} SYP\n"
-        f"📋 معلومات الحساب: {details}"
-    )
-
-    _, sent_msg = await notify_next_admin(text=admin_text, reply_markup=admin_kb)
-
-    if sent_msg:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE pending_bot_withdraws SET admin_msg_id = ? WHERE id = ?", (sent_msg.message_id, wit_id))
-            await db.commit()
-
-    await message.answer(f"⏳ جاري معالجة طلب السحب برقم `#{wit_id}` وإرساله للإدارة.\n\n📊 نسبة العمولة المطبقة: {comm_rate}%\n✂️ قيمة العمولة: {commission} SYP\n💰 الصافي الذي ستستلمه: {net_amount} SYP")
-    await state.clear()
-
-
-@dp.callback_query(F.data.startswith("bw_yes_") | F.data.startswith("bw_no_"))
-async def admin_bot_withdraw_decision(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not await is_admin(callback.from_user.id):
-        return
-    data_parts = callback.data.split("_")
-    if len(data_parts) >= 3:
-        action = data_parts[1]
-        wit_id = int(data_parts[2])
-    else:
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id, method, amount, commission, net_amount, details FROM pending_bot_withdraws WHERE id = ?", (wit_id,)) as cur:
-            row = await cur.fetchone()
-        
-        await db.execute("DELETE FROM pending_bot_withdraws WHERE id = ?", (wit_id,))
-        await db.commit()
-
-    if action == "yes":
-        if row:
-            uid, method, amount, commission, net_amount, details = row
-            await log_financial(wit_id, uid, "bot_withdraw", net_amount, "SYP")
-            new_balance = await get_user_balance(uid)
-
-            try:
-                await bot.send_message(
-                    uid,
-                    f"تم تنفيذ طلب سحب الرصيد رقم `#{wit_id}` بنجاح ✅\n\n"
-                    f"💳 الطريقة: {method}\n"
-                    f"💵 المبلغ الإجمالي: {amount} SYP\n"
-                    f"✂️ عمولة البوت: {commission} SYP\n"
-                    f"💰 المبلغ الصافي المستلم: **{net_amount} SYP**\n"
-                    f"💳 رصيد البوت المتبقي لديك: {new_balance} SYP"
-                )
-            except Exception:
-                pass
-            try:
-                await callback.message.edit_text(callback.message.text + f"\n\n✅ تمت الموافقة على السحب رقم `#{wit_id}` وإرسال الصافي للمشترك.")
-            except Exception:
-                pass
+        if method == "شام كاش دولار 💲":
+            bot.send_message(
+                target_user_id,
+                "يرجى المحاوله في وقت لاحق 🔴",
+            )
         else:
-            await callback.answer("❌ البيانات غير موجودة أو تم التعامل معها مسبقاً.", show_alert=True)
-    else:
-        if row:
-            uid, amount = row[0], row[2]
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("UPDATE wallets SET balance = balance + ? WHERE user_id = ?", (amount, uid))
-                await db.commit()
+            bot.send_message(
+                target_user_id,
+                "يرجى المحاوله بعد قليل وشكرا 🌸",
+            )
 
-            try:
-                await bot.send_message(
-                    uid,
-                    f"❌ عذراً، تم رفض طلب سحب الرصيد رقم `#{wit_id}` من قبل الإدارة وإعادة المبلغ الإجمالي ({amount} SYP) إلى رصيدك بالكامل."
-                )
-            except Exception:
-                pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "btn_deposit_bot")
+def handle_deposit_bot_button(call):
+    """عرض طرق الشحن المتاحة إلى البوت عند الضغط على زر شحن رصيد الى البوت ⬇️."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+
+    ensure_user(user)
+    set_user_state(user.id, None, None)
+    bot.answer_callback_query(call.id, "طرق الشحن")
+    send_custom_button_media_if_any(chat_id, "btn_deposit_bot")
+    default_msg = "اختر احد طرق الشحن المتاحه 👇"
+    bot.send_message(
+        chat_id,
+        get_custom_button_text("btn_deposit_bot", default_msg),
+        reply_markup=bot_deposit_methods_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "dep_method_syriatel")
+def handle_syriatel_method(call):
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+    ensure_user(user)
+    set_user_state(user.id, "dep_syriatel_waiting_amount", None)
+    bot.answer_callback_query(call.id, "سيرياتيل كاش")
+    bot.send_message(
+        chat_id,
+        "📱 شحن عبر سيرياتيل كاش\n\n"
+        "أرسل المبلغ الذي تريد تحويله.\n"
+        "الحد الأدنى: 200 ليرة سورية جديدة.",
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "dep_method_sham_syp")
+def handle_sham_syp_method(call):
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+    ensure_user(user)
+    set_user_state(user.id, "dep_sham_syp_waiting_tx", None)
+    bot.answer_callback_query(call.id, "شام كاش سوري")
+    bot.send_message(
+        chat_id,
+        "قم بالتحويل الى الكود التالي\n\n"
+        f"<code>{get_sham_cash_syp_code()}</code>\n"
+        "ثم ادخل رقم العملية\n\n"
+        "الحد الادنى للشحن: SYP 200.00\n"
+        "يرجى الانتباه الى ان اي مبلغ اقل من الحد الادنى لن تتم معالجته ولا يمكن استرداده",
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "dep_method_sham_usd")
+def handle_sham_usd_method(call):
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+    ensure_user(user)
+    set_user_state(user.id, "dep_sham_usd_waiting_tx", None)
+    bot.answer_callback_query(call.id, "شام كاش دولار")
+    usd_rate = format_amount(get_sham_cash_usd_rate_syp())
+    bot.send_message(
+        chat_id,
+        "قم بالتحويل الى الكود التالي\n\n"
+        f"<code>{get_sham_cash_usd_code()}</code>\n\n"
+        "ثم ادخل رقم العملية\n"
+        f"كل 1 شام كاش 💲 (اوتو 💱) تعادل: SYP {usd_rate}.00",
+        reply_markup=cancel_to_main_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "dep_method_bemo")
+def handle_bemo_method(call):
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+    set_user_state(user.id, None, None)
+    bot.answer_callback_query(call.id, "الخدمه متوقفه حاليا ⚙️")
+    bot.send_message(
+        chat_id,
+        "الخدمه متوقفه حاليا ⚙️",
+        reply_markup=bot_deposit_methods_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("dep_approve:", "dep_reject:")))
+def handle_admin_deposit_actions(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "هذا الإجراء مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+
+    action, dep_id_str = call.data.split(":", 1)
+    dep_id = int(dep_id_str)
+    dep_row = get_bot_deposit_request(dep_id)
+
+    if not dep_row:
+        bot.answer_callback_query(call.id, "طلب الشحن غير موجود.", show_alert=True)
+        return
+
+    if dep_row["status"] != "pending":
+        bot.answer_callback_query(call.id, "تمت معالجة هذا الطلب مسبقاً.", show_alert=True)
+        return
+
+    target_user_id = int(dep_row["user_id"])
+    raw_amount = float(dep_row["amount"])
+    method = str(dep_row["method"])
+    usd_rate = get_sham_cash_usd_rate_syp()
+
+    if method == "شام كاش دولار 💲":
+        credit_syp = round(raw_amount * usd_rate, 2)
+    else:
+        credit_syp = round(raw_amount, 2)
+
+    formatted_credit_syp = format_amount(credit_syp)
+
+    if action == "dep_approve":
+        set_bot_deposit_status(dep_id, "approved")
+        new_balance = add_user_balance(target_user_id, credit_syp)
+        formatted_new_balance = format_amount(new_balance)
+
+        bot.answer_callback_query(call.id, "تمت الموافقة وإضافة الرصيد ✅")
         try:
-            await callback.message.edit_text(callback.message.text + f"\n\n❌ تم رفض طلب السحب رقم `#{wit_id}` وإعادة المبلغ بالكامل للمشترك.")
+            bot.edit_message_reply_markup(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None,
+            )
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=call.message.html_text + "\n\n✅ <b>تمت الموافقة وإضافة الرصيد</b>",
+            )
         except Exception:
             pass
 
-    await callback.answer()
+        if method == "شام كاش دولار 💲":
+            bot.send_message(
+                target_user_id,
+                f"تم اضافه مبلغ {formatted_credit_syp}SYP بنجاح ✅\n"
+                f"رصيد البوت الجديد {formatted_new_balance}SYP",
+            )
+        elif method == "شام كاش سوري 💵":
+            bot.send_message(
+                target_user_id,
+                f"تم شحن مبلغ {formatted_credit_syp}SYP بنجاح ✅\n"
+                f"رصيد البوت الجديد {formatted_new_balance}SYP",
+            )
+        else:
+            bot.send_message(
+                target_user_id,
+                f"تم اضافة مبلغ {formatted_credit_syp}SYP بنجاح ✅\n"
+                f"رصيد البوت الجديد {formatted_new_balance}SYP",
+            )
+
+    elif action == "dep_reject":
+        set_bot_deposit_status(dep_id, "rejected")
+        bot.answer_callback_query(call.id, "تم رفض طلب الشحن ❌")
+        try:
+            bot.edit_message_reply_markup(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None,
+            )
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=call.message.html_text + "\n\n❌ <b>تم رفض الطلب</b>",
+            )
+        except Exception:
+            pass
+
+        if method == "شام كاش دولار 💲":
+            bot.send_message(
+                target_user_id,
+                "العمليه غير صحيحه .يرجى التأكد من المعلومات والمحاوله مره اخرى 🔴",
+            )
+        elif method == "شام كاش سوري 💵":
+            bot.send_message(
+                target_user_id,
+                "العمليه غير صحيحه .يرجى التأكد من المعلومات واعادة المحاوله 🔴",
+            )
+        else:
+            bot.send_message(
+                target_user_id,
+                "يرجى المحاوله في وقت لاحق",
+            )
 
 
-# ========================================================
-# === شحن الحساب والبوت والإنشاء ===
-# ========================================================
-@dp.callback_query(F.data == "acc_deposit")
-async def cb_acc_deposit_start(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT ichancy_username FROM ichancy_accounts WHERE user_id = ?", (user_id,)) as cur:
-            if not await cur.fetchone():
-                await callback.answer("❌ يجب عليك إنشاء حساب ichancy أولاً قبل محاولة الشحن إليه.", show_alert=True)
-                return
+@bot.callback_query_handler(func=lambda call: call.data == "btn_ichancy")
+def handle_ichancy_button(call):
+    """فتح قائمة Ichancy عند الضغط على زر ⚡ichancy ⚡."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
 
-        async with db.execute("SELECT amount FROM pending_acc_deposits WHERE user_id = ?", (user_id,)) as cur:
-            if await cur.fetchone():
-                await callback.answer("⚠️ لديك طلب شحن حساب قيد المراجعة لدى الإدارة بالفعل!", show_alert=True)
-                return
-
-    await state.set_state(AccountDepositStates.waiting_for_amount)
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع ♻️", callback_data="back_to_dashboard")]])
-    
-    text = "ادخل المبلغ المراد شحنه في حسابك 👇"
-    try:
-        await callback.message.edit_text(text, reply_markup=back_kb)
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(AccountDepositStates.waiting_for_amount)
-async def process_acc_deposit_amount(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال مبلغ صالح:")
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
         return
-    try:
-        amount = float(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال رقم صحيح للمبلغ المراد شحنه:")
-        return
 
-    if amount < 200.0:
-        await message.answer("❌ الحد الأدنى لشحن الحساب هو 200 SYP. يرجى إدخال مبلغ صالح:")
-        return
-
-    user = message.from_user
-    bot_balance = await get_user_balance(user.id)
-
-    if amount > bot_balance:
-        await message.answer("تم رفض المعالجة لعدم توفر رصيد كافي 🔴")
-        await state.clear()
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO pending_acc_deposits (user_id, amount) VALUES (?, ?)",
-            (user.id, amount)
-        )
-        await db.commit()
-
-    await message.answer("جاري التحويل والاتصال بالخوادم .⏳")
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ موافقة", callback_data=f"ad_yes_{user.id}"),
-            InlineKeyboardButton(text="❌ رفض", callback_data=f"ad_no_{user.id}")
-        ]
-    ])
-
-    await notify_next_admin(
-        f"📥 طلب شحن رصيد الحساب:\n\n"
-        f"👤 المشترك: @{user.username or 'بدون'} ({user.id})\n"
-        f"💵 المبلغ المراد تحويله لحساب اللاعب: {amount} SYP\n"
-        f"💳 رصيد المشترك الحالي في البوت: {bot_balance} SYP",
-        reply_markup=admin_kb
+    set_user_state(user.id, None, None)
+    bot.answer_callback_query(call.id, "Ichancy")
+    send_custom_button_media_if_any(chat_id, "btn_ichancy")
+    bot.send_message(
+        chat_id,
+        get_custom_button_text("btn_ichancy", "Ichancy"),
+        reply_markup=ichancy_menu_keyboard(),
     )
 
-    await state.clear()
 
+@bot.callback_query_handler(func=lambda call: call.data == "ichancy_create")
+def handle_ichancy_create(call):
+    """بدء خطوة إدخال اسم الحساب أو منع التكرار إذا كان يملك حساباً مفعلاً."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
 
-@dp.callback_query(F.data.startswith("ad_yes_") | F.data.startswith("ad_no_"))
-async def admin_acc_deposit_decision(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not await is_admin(callback.from_user.id):
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
         return
-    data_parts = callback.data.split("_")
-    if len(data_parts) >= 3:
-        action = data_parts[1]
-        uid = int(data_parts[2])
-    else:
+
+    existing_acc = get_active_ichancy_account(user.id)
+    if existing_acc:
+        set_user_state(user.id, None, None)
+        bot.answer_callback_query(call.id, "لديك حساب مفعل بالفعل", show_alert=True)
+        bot.send_message(
+            chat_id,
+            "لايمكن انشاء حساب أخر لديك حساب مفعل 🌸\n\n"
+            f"👤 اسم الحساب: <code>{existing_acc['acc_username']}</code>\n"
+            f"🔑 كلمة المرور: <code>{existing_acc['acc_password']}</code>",
+            reply_markup=ichancy_menu_keyboard(),
+        )
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT amount FROM pending_acc_deposits WHERE user_id = ?", (uid,)) as cur:
-            row = await cur.fetchone()
-        
-        await db.execute("DELETE FROM pending_acc_deposits WHERE user_id = ?", (uid,))
-        await db.commit()
+    set_user_state(user.id, "ichancy_waiting_username", None)
+    bot.answer_callback_query(call.id, "أدخل الاسم")
+    bot.send_message(
+        chat_id,
+        "أدخل الاسم بشرط ان لا يقل عن ثماني احرف انجليزيه صغيره وأحرف (بدون رموز )👇",
+        reply_markup=cancel_to_main_keyboard(),
+    )
 
-    if action == "yes":
-        if row:
-            amount = row[0]
-            current_balance = await get_user_balance(uid)
 
-            if amount > current_balance:
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith(("req_approve:", "req_reject:", "req_edit_user:", "req_edit_pass:"))
+)
+def handle_admin_request_actions(call):
+    if not is_main_admin(call.from_user):
+        bot.answer_callback_query(call.id, "هذا الإجراء مخصص للمشرف الرئيسي Ola276 فقط.", show_alert=True)
+        return
+
+    action, req_id_str = call.data.split(":", 1)
+    req_id = int(req_id_str)
+    req_row = get_account_request(req_id)
+
+    if not req_row:
+        bot.answer_callback_query(call.id, "الطلب غير موجود.", show_alert=True)
+        return
+
+    target_user_id = int(req_row["user_id"])
+
+    if req_row["status"] != "pending" and action in {"req_approve", "req_reject"}:
+        bot.answer_callback_query(call.id, "تمت معالجة هذا الطلب مسبقاً.", show_alert=True)
+        return
+
+    if action == "req_approve":
+        set_request_status(req_id, "approved")
+        save_active_ichancy_account(
+            target_user_id,
+            req_row["acc_username"],
+            req_row["acc_password"],
+        )
+        set_user_state(target_user_id, None, None)
+
+        bot.answer_callback_query(call.id, "تمت الموافقة وإرسال الحساب للمشترك ✅")
+        updated_req = get_account_request(req_id)
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=build_admin_request_text(updated_req),
+            )
+        except Exception:
+            pass
+
+        bot.send_message(
+            target_user_id,
+            "✅ تم إنشاء وتفعيل حساب ichancy الخاص بك بنجاح:\n\n"
+            f"🆔 آيدي المشترك: <code>{target_user_id}</code>\n"
+            f"👤 اسم الحساب: <code>{updated_req['acc_username']}</code>\n"
+            f"🔑 كلمة المرور: <code>{updated_req['acc_password']}</code>",
+        )
+
+    elif action == "req_reject":
+        set_request_status(req_id, "rejected")
+        set_user_state(target_user_id, None, None)
+
+        bot.answer_callback_query(call.id, "تم رفض الطلب ❌")
+        updated_req = get_account_request(req_id)
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=build_admin_request_text(updated_req),
+            )
+        except Exception:
+            pass
+
+        bot.send_message(
+            target_user_id,
+            "يرجى المحاوله في وقت لاحق",
+        )
+
+    elif action == "req_edit_user":
+        set_user_state(call.from_user.id, "admin_editing_username", str(req_id))
+        bot.answer_callback_query(call.id, "أرسل الاسم الجديد")
+        bot.send_message(
+            call.from_user.id,
+            f"✏️ أرسل الاسم الجديد للطلب #{req_id} (8 أحرف إنجليزية صغيرة على الأقل وبدون رموز):",
+        )
+
+    elif action == "req_edit_pass":
+        set_user_state(call.from_user.id, "admin_editing_password", str(req_id))
+        bot.answer_callback_query(call.id, "أرسل كلمة المرور الجديدة")
+        bot.send_message(
+            call.from_user.id,
+            f"🔑 أرسل كلمة المرور الجديدة للطلب #{req_id}:",
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("btn_"))
+def handle_main_feature_buttons(call):
+    """معالجة الضغط على بقية الأزرار الرئيسية مع دعم الرسالة والصور المخصصة."""
+    user = call.from_user
+    chat_id = call.message.chat.id
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if not is_user_subscribed(user.id):
+        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
+        send_force_sub_message(chat_id, is_new_user=False)
+        return
+
+    button_titles = {
+        "btn_offers": "العروض الحاليه 🎁",
+        "btn_terms": "الشروط والاحكام 📝",
+        "btn_lottery": "الياناصيب الاسبوعي💵",
+    }
+    title = button_titles.get(call.data, "خيار")
+    bot.answer_callback_query(call.id, title)
+    send_custom_button_media_if_any(chat_id, call.data)
+    default_msg = f"تم اختيار: <b>{title}</b>"
+    bot.send_message(
+        chat_id,
+        get_custom_button_text(call.data, default_msg),
+    )
+
+
+@bot.message_handler(content_types=["photo"])
+def handle_photo_messages(message):
+    """معالجة الصور المرسلة للوحة تحكم المشرف أو التواصل مع الدعم أو ردود المشرف Ola276."""
+    user = message.from_user
+    chat_id = message.chat.id
+    caption = (message.caption or "").strip()
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    best_photo_id = message.photo[-1].file_id if message.photo else None
+    state, temp_data = get_user_state(user.id)
+
+    # حفظ صورة مخصصة لأي زر من لوحة تحكم المشرف Ola276
+    if is_main_admin(user) and state == "adm_waiting_btn_photo" and temp_data and best_photo_id:
+        btn_key = temp_data
+        save_button_photo(btn_key, best_photo_id)
+        if caption:
+            save_button_message(btn_key, caption)
+        set_user_state(user.id, None, None)
+        btn_title = BUTTON_KEY_TO_TITLE.get(btn_key, btn_key)
+        bot.send_message(
+            chat_id,
+            f"✅ تم حفظ الصورة للزر <b>{btn_title}</b> بنجاح."
+            + ("\n✍️ وتم تحديث نص الرسالة المرفقة أيضاً." if caption else ""),
+            reply_markup=admin_single_button_actions_keyboard(btn_key),
+        )
+        return
+
+    if is_main_admin(user) and state == "admin_replying_support" and temp_data and best_photo_id:
+        ticket_id = int(temp_data)
+        ticket = get_support_ticket(ticket_id)
+        set_user_state(user.id, None, None)
+        if not ticket:
+            bot.send_message(chat_id, "تذكرة الدعم غير موجودة.")
+            return
+
+        target_user_id = int(ticket["user_id"])
+        reply_caption = "💬 <b>رد الدعم:</b>"
+        if caption:
+            reply_caption += f"\n{caption}"
+        bot.send_photo(target_user_id, photo=best_photo_id, caption=reply_caption)
+        mark_support_ticket_replied(ticket_id)
+        bot.send_message(chat_id, f"✅ تم إرسال ردك بنجاح إلى المشترك صاحب التذكرة #{ticket_id}.")
+        return
+
+    if state == "support_waiting_message" and best_photo_id:
+        if not is_user_subscribed(user.id):
+            send_force_sub_message(chat_id, is_new_user=False)
+            return
+
+        ensure_user(user)
+        set_user_state(user.id, None, None)
+        ticket_id = create_support_ticket(
+            user.id,
+            "photo",
+            content_text=caption or None,
+            photo_file_id=best_photo_id,
+        )
+        bot.send_message(chat_id, "✅ تم إرسال رسالتك إلى فريق الدعم بنجاح، سنرد عليك في أقرب وقت.")
+        send_support_ticket_to_ola276(ticket_id)
+        return
+
+    first_time = is_first_time_user(user.id)
+    ensure_user(user)
+    if first_time or not is_user_subscribed(user.id):
+        send_force_sub_message(chat_id, is_new_user=first_time)
+
+
+@bot.message_handler(func=lambda msg: True)
+def handle_text(message):
+    """التعامل مع الرسائل النصية وحالات لوحة التحكم والدعم والسحب والشحن وإنشاء الحساب."""
+    user = message.from_user
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+    sync_ola276_identity(user)
+    setup_bottom_menu(chat_id, user=user)
+
+    if is_main_admin(user):
+        flush_pending_requests_to_ola276()
+
+    state, temp_data = get_user_state(user.id)
+
+    # 0. حالات لوحة تحكم المشرف الرئيسي Ola276
+    if is_main_admin(user) and state:
+        if state == "adm_waiting_btn_msg" and temp_data:
+            if not text:
+                bot.send_message(chat_id, "❌ يرجى إرسال نص الرسالة.")
+                return
+            btn_key = temp_data
+            save_button_message(btn_key, text)
+            set_user_state(user.id, None, None)
+            bot.send_message(
+                chat_id,
+                f"✅ تم حفظ الرسالة الجديدة للزر <b>{BUTTON_KEY_TO_TITLE.get(btn_key, btn_key)}</b>.",
+                reply_markup=admin_single_button_actions_keyboard(btn_key),
+            )
+            return
+
+        if state == "adm_waiting_user_query":
+            target_row = find_user_by_query(text)
+            if not target_row:
+                bot.send_message(chat_id, "❌ لم يتم العثور على مشترك بهذا الآيدي أو المعرف. أعد المحاولة:")
+                return
+            set_user_state(user.id, None, None)
+            t_id = int(target_row["user_id"])
+            t_uname = f"@{target_row['username']}" if target_row["username"] else "غير متوفر"
+            t_bal = format_amount(float(target_row["balance"]))
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("➕ إضافة رصيد", callback_data=f"adm_bal_op:add:{t_id}"),
+                InlineKeyboardButton("➖ خصم رصيد", callback_data=f"adm_bal_op:sub:{t_id}"),
+            )
+            kb.row(
+                InlineKeyboardButton("🎯 تعيين رصيد", callback_data=f"adm_bal_op:set:{t_id}"),
+                InlineKeyboardButton("⬅️ رجوع", callback_data="adm_open_panel"),
+            )
+            bot.send_message(
+                chat_id,
+                f"👤 <b>بيانات المشترك</b>\n\n"
+                f"🆔 الآيدي: <code>{t_id}</code>\n"
+                f"🔗 المعرف: {t_uname}\n"
+                f"💰 الرصيد الحالي: <b>{t_bal} SYP</b>\n"
+                f"📅 تاريخ التسجيل: <code>{target_row['created_at']}</code>",
+                reply_markup=kb,
+            )
+            return
+
+        if state.startswith("adm_bal_amount_") and temp_data:
+            op_type = state.replace("adm_bal_amount_", "")
+            target_id = int(temp_data)
+            cleaned_num = text.replace(",", ".").strip()
+            try:
+                val = float(cleaned_num)
+            except ValueError:
+                bot.send_message(chat_id, "❌ أدخل رقماً صحيحاً.")
+                return
+            if val < 0:
+                bot.send_message(chat_id, "❌ يجب أن يكون المبلغ 0 أو أكبر.")
+                return
+            row_before = get_user_row_by_id(target_id)
+            cur_bal = float(row_before["balance"]) if row_before else 0.0
+            if op_type == "add":
+                new_bal = add_user_balance(target_id, val)
+            elif op_type == "sub":
+                new_bal = set_user_balance_exact(target_id, cur_bal - val)
+            else:
+                new_bal = set_user_balance_exact(target_id, val)
+            set_user_state(user.id, None, None)
+            bot.send_message(
+                chat_id,
+                f"✅ تم تحديث رصيد المشترك <code>{target_id}</code> إلى: <b>{format_amount(new_bal)} SYP</b>",
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+        if state == "adm_waiting_channel":
+            clean_ch = text.strip()
+            uname_ch = clean_ch if clean_ch.startswith("@") else f"@{clean_ch}"
+            url_ch = f"https://t.me/{uname_ch.lstrip('@')}"
+            set_setting("channel_username", uname_ch)
+            set_setting("channel_url", url_ch)
+            set_user_state(user.id, None, None)
+            bot.send_message(
+                chat_id,
+                f"✅ تم تحديث قناة الاشتراك الإجباري إلى: <code>{uname_ch}</code>",
+                reply_markup=admin_settings_keyboard(),
+            )
+            return
+
+        if state == "adm_waiting_code_syr":
+            set_setting("syriatel_code", text)
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, f"✅ تم تحديث كود سيرياتيل كاش إلى: <code>{text}</code>", reply_markup=admin_settings_keyboard())
+            return
+
+        if state == "adm_waiting_code_sham_syp":
+            set_setting("sham_cash_syp_code", text)
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, f"✅ تم تحديث كود شام كاش السوري إلى: <code>{text}</code>", reply_markup=admin_settings_keyboard())
+            return
+
+        if state == "adm_waiting_code_sham_usd":
+            set_setting("sham_cash_usd_code", text)
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, f"✅ تم تحديث كود شام كاش الدولار إلى: <code>{text}</code>", reply_markup=admin_settings_keyboard())
+            return
+
+        if state == "adm_waiting_rates":
+            parts = text.replace(",", ".").split()
+            if len(parts) != 3:
+                bot.send_message(chat_id, "❌ أرسل 3 أرقام: سعر صرف الشحن، سعر صرف السحب، ونسبة العمولة %.")
+                return
+            try:
+                dep_r = float(parts[0])
+                wdr_r = float(parts[1])
+                comm_pct = float(parts[2])
+            except ValueError:
+                bot.send_message(chat_id, "❌ يرجى إدخال أرقام صحيحة.")
+                return
+            set_setting("sham_cash_usd_rate_syp", str(dep_r))
+            set_setting("withdraw_usd_rate_syp", str(wdr_r))
+            set_setting("withdraw_commission_rate", str(comm_pct / 100.0))
+            set_user_state(user.id, None, None)
+            bot.send_message(
+                chat_id,
+                f"✅ تم تحديث الأسعار والعمولة: شحن USD = <b>{format_amount(dep_r)}</b> | سحب USD = <b>{format_amount(wdr_r)}</b> | عمولة = <b>{format_amount(comm_pct)}%</b>",
+                reply_markup=admin_settings_keyboard(),
+            )
+            return
+
+        if state == "adm_waiting_broadcast":
+            set_user_state(user.id, None, None)
+            with get_connection() as conn:
+                all_users = conn.execute("SELECT user_id FROM users").fetchall()
+            sent_ok = 0
+            for u_row in all_users:
                 try:
-                    await bot.send_message(uid, "تم رفض المعالجة لعدم توفر رصيد كافي 🔴")
+                    bot.send_message(int(u_row["user_id"]), text)
+                    sent_ok += 1
                 except Exception:
                     pass
-                try:
-                    await callback.message.edit_text(callback.message.text + "\n\n❌ تم رفض الطلب: رصيد المشترك غير كافٍ.")
-                except Exception:
-                    pass
-                await callback.answer("❌ رصيد المشترك غير كافٍ!", show_alert=True)
+            bot.send_message(
+                chat_id,
+                f"✅ تم إرسال الإذاعة إلى <b>{sent_ok}</b> من أصل <b>{len(all_users)}</b> مشترك.",
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+    # 1. معالجة رد المشرف الرئيسي Ola276 على رسالة الدعم
+    if is_main_admin(user) and state == "admin_replying_support" and temp_data:
+        ticket_id = int(temp_data)
+        ticket = get_support_ticket(ticket_id)
+        set_user_state(user.id, None, None)
+        if not ticket:
+            bot.send_message(chat_id, "تذكرة الدعم غير موجودة.")
+            return
+        if not text:
+            bot.send_message(chat_id, "❌ يرجى إرسال نص الرد أو صورة.")
+            return
+
+        target_user_id = int(ticket["user_id"])
+        bot.send_message(target_user_id, f"💬 <b>رد الدعم:</b>\n{text}")
+        mark_support_ticket_replied(ticket_id)
+        bot.send_message(chat_id, f"✅ تم إرسال ردك بنجاح إلى المشترك صاحب التذكرة #{ticket_id}.")
+        return
+
+    # 2. معالجة رسالة الدعم النصية القادمة من المشترك
+    if state == "support_waiting_message":
+        if not text:
+            bot.send_message(
+                chat_id,
+                "💬 التواصل مع الدعم\n\n"
+                "اكتب رسالتك أو أرسل صورة مع وصف وسنرد عليك في أقرب وقت:",
+                reply_markup=support_cancel_keyboard(),
+            )
+            return
+
+        set_user_state(user.id, None, None)
+        ticket_id = create_support_ticket(user.id, "text", content_text=text, photo_file_id=None)
+        bot.send_message(chat_id, "✅ تم إرسال رسالتك إلى فريق الدعم بنجاح، سنرد عليك في أقرب وقت.")
+        send_support_ticket_to_ola276(ticket_id)
+        return
+
+    # 3. معالجة إدخال المشرف الرئيسي Ola276 لتعديل الاسم أو كلمة المرور في طلب معلق
+    if is_main_admin(user) and state in {"admin_editing_username", "admin_editing_password"} and temp_data:
+        req_id = int(temp_data)
+        req_row = get_account_request(req_id)
+        if not req_row:
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, "الطلب غير موجود.")
+            return
+
+        if state == "admin_editing_username":
+            if not USERNAME_PATTERN.match(text):
+                bot.send_message(
+                    chat_id,
+                    "❌ الاسم غير مطابق للشرط: يجب أن يكون 8 أحرف إنجليزية صغيرة على الأقل وأحرف فقط بدون رموز. أعد الإرسال:",
+                )
                 return
+            update_request_username(req_id, text)
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, f"✅ تم تحديث اسم الحساب للطلب #{req_id} إلى: <code>{text}</code>")
+            send_request_to_ola276(req_id)
+            return
 
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("UPDATE wallets SET balance = balance - ? WHERE user_id = ?", (amount, uid))
-                await db.commit()
-
-            new_balance = await get_user_balance(uid)
-
-            try:
-                await bot.send_message(
-                    uid,
-                    f"تم شحن حسابك بنجاح✅\n\nالمبلغ المشحون: {amount} SYP\nرصيد البوت الجديد: {new_balance} SYP"
-                )
-            except Exception:
-                pass
-            try:
-                await callback.message.edit_text(callback.message.text + "\n\n✅ تمت الموافقة وخصم المبلغ من رصيد البوت وشحن الحساب.")
-            except Exception:
-                pass
-        else:
-            await callback.answer("❌ البيانات غير موجودة أو تم التعامل معها مسبقاً.", show_alert=True)
-    else:
-        try:
-            await bot.send_message(uid, "تم رفض المعالجة لعدم توفر رصيد كافي 🔴")
-        except Exception:
-            pass
-        try:
-            await callback.message.edit_text(callback.message.text + "\n\n❌ تم رفض المعالجة من قبل الإدارة.")
-        except Exception:
-            pass
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "bot_deposit")
-async def cb_bot_deposit_menu(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    
-    await callback.message.answer(
-        "💳 أختر احد طرق الشحن المتاحه:",
-        reply_markup=get_bot_deposit_methods_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "back_to_dashboard")
-async def cb_back_to_dashboard(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user = callback.from_user
-    balance = await get_user_balance(user.id)
-    text = (
-        f"🤖 لوحة تحكم الخدمات:\n\n"
-        f"💳 الرصيد الحالي: {balance} SYP\n"
-        f"🆔 أيدي حسابك: {user.id}"
-    )
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    await callback.message.answer(text, reply_markup=get_dashboard_keyboard())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "dep_syritel")
-async def cb_syritel_deposit_start(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(BotSyritelDepositStates.waiting_for_trx_id)
-    caption_text = await fetch_setting("msg_dep_syritel")
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع ♻️", callback_data="bot_deposit")]])
-
-    try:
-        await callback.message.delete()
-        if os.path.exists(DEFAULT_SYRITEL_QR):
-            photo = FSInputFile(DEFAULT_SYRITEL_QR)
-            await callback.message.answer_photo(photo=photo, caption=caption_text, reply_markup=back_kb)
-        else:
-            await callback.message.answer(caption_text, reply_markup=back_kb)
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(BotSyritelDepositStates.waiting_for_trx_id)
-async def process_syritel_trx_id(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال رقم العملية كـ نص:")
-        return
-    trx_id = message.text.strip()
-    await state.update_data(trx_id=trx_id)
-    await state.set_state(BotSyritelDepositStates.waiting_for_amount)
-    await message.answer("ادخل المبلغ المراد شحنه 👇")
-
-
-@dp.message(BotSyritelDepositStates.waiting_for_amount)
-async def process_syritel_amount(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال مبلغ صالح:")
-        return
-    try:
-        amount = float(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال رقم صحيح للمبلغ المراد شحنه:")
-        return
-
-    if amount < 200.0:
-        await message.answer("❌ الحد الأدنى للشحن هو SYP 200.00. يرجى إدخال مبلغ صالح:")
-        return
-
-    data = await state.get_data()
-    trx_id = data.get("trx_id")
-    user = message.from_user
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "INSERT INTO pending_bot_deposits (user_id, method, trx_id, amount) VALUES (?, ?, ?, ?)",
-            (user.id, "syritel", trx_id, amount)
-        )
-        dep_id = cursor.lastrowid
-        await db.commit()
-
-    await message.answer(f"جاري معالجة العملية رقم `#{dep_id}` .انتظر قليلا ⏳")
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ موافقة", callback_data=f"bd_yes_{dep_id}"),
-            InlineKeyboardButton(text="❌ رفض", callback_data=f"bd_no_{dep_id}")
-        ]
-    ])
-
-    await notify_next_admin(
-        f"📥 **طلب شحن رصيد بوت جديد (سيريتل كاش) (#`{dep_id}`):**\n\n"
-        f"👤 المشترك: @{user.username or 'بدون'} (`{user.id}`)\n"
-        f"💳 رقم عملية التحويل: {trx_id}\n"
-        f"💵 المبلغ المدخل: {amount} SYP",
-        reply_markup=admin_kb
-    )
-
-    await state.clear()
-
-
-@dp.callback_query(F.data == "dep_sham_syp")
-async def cb_sham_syp_deposit_start(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(BotShamSypDepositStates.waiting_for_trx_id)
-    caption_text = await fetch_setting("msg_dep_sham_syp")
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع ♻️", callback_data="bot_deposit")]])
-
-    try:
-        await callback.message.delete()
-        if os.path.exists(DEFAULT_SHAM_SYP_QR):
-            photo = FSInputFile(DEFAULT_SHAM_SYP_QR)
-            await callback.message.answer_photo(photo=photo, caption=caption_text, reply_markup=back_kb)
-        else:
-            await callback.message.answer(caption_text, reply_markup=back_kb)
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(BotShamSypDepositStates.waiting_for_trx_id)
-async def process_sham_syp_trx_id(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال رقم العملية كـ نص:")
-        return
-    trx_id = message.text.strip()
-    await state.update_data(trx_id=trx_id)
-    await state.set_state(BotShamSypDepositStates.waiting_for_amount)
-    await message.answer("ادخل المبلغ المراد شحنه .👇")
-
-
-@dp.message(BotShamSypDepositStates.waiting_for_amount)
-async def process_sham_syp_amount(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال مبلغ صالح:")
-        return
-    try:
-        amount = float(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال رقم صحيح للمبلغ المراد شحنه:")
-        return
-
-    if amount < 200.0:
-        await message.answer("❌ الحد الأدنى للشحن هو SYP 200.00. يرجى إدخال مبلغ صالح:")
-        return
-
-    data = await state.get_data()
-    trx_id = data.get("trx_id")
-    user = message.from_user
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "INSERT INTO pending_bot_deposits (user_id, method, trx_id, amount) VALUES (?, ?, ?, ?)",
-            (user.id, "sham_syp", trx_id, amount)
-        )
-        dep_id = cursor.lastrowid
-        await db.commit()
-
-    await message.answer(f"جاري معالجة العملية رقم `#{dep_id}` .انتظر قليلا ⏳")
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ موافقة", callback_data=f"bd_yes_{dep_id}"),
-            InlineKeyboardButton(text="❌ رفض", callback_data=f"bd_no_{dep_id}")
-        ]
-    ])
-
-    await notify_next_admin(
-        f"📥 **طلب شحن رصيد بوت جديد (شام كاش سوري) (#`{dep_id}`):**\n\n"
-        f"👤 المشترك: @{user.username or 'بدون'} (`{user.id}`)\n"
-        f"💳 رقم عملية التحويل: {trx_id}\n"
-        f"💵 المبلغ المدخل: {amount} SYP",
-        reply_markup=admin_kb
-    )
-
-    await state.clear()
-
-
-@dp.callback_query(F.data == "dep_sham_usd")
-async def cb_sham_usd_deposit_start(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(BotShamUsdDepositStates.waiting_for_trx_id)
-    caption_text = await fetch_setting("msg_dep_sham_usd")
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="رجوع ♻️", callback_data="bot_deposit")]])
-
-    try:
-        await callback.message.delete()
-        if os.path.exists(DEFAULT_SHAM_USD_QR):
-            photo = FSInputFile(DEFAULT_SHAM_USD_QR)
-            await callback.message.answer_photo(photo=photo, caption=caption_text, reply_markup=back_kb)
-        else:
-            await callback.message.answer(caption_text, reply_markup=back_kb)
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.message(BotShamUsdDepositStates.waiting_for_trx_id)
-async def process_sham_usd_trx_id(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال رقم العملية كـ نص:")
-        return
-    trx_id = message.text.strip()
-    await state.update_data(trx_id=trx_id)
-    await state.set_state(BotShamUsdDepositStates.waiting_for_amount)
-    await message.answer("ادخل المبلغ المراد شحنه .👇")
-
-
-@dp.message(BotShamUsdDepositStates.waiting_for_amount)
-async def process_sham_usd_amount(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال مبلغ صالح:")
-        return
-    try:
-        amount = float(message.text.strip())
-    except ValueError:
-        await message.answer("❌ يرجى إدخال رقم صحيح للمبلغ المراد شحنه:")
-        return
-
-    if amount < 1.0:
-        await message.answer("❌ الحد الأدنى للشحن هو USD 1.00. يرجى إدخال مبلغ صالح:")
-        return
-
-    data = await state.get_data()
-    trx_id = data.get("trx_id")
-    user = message.from_user
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "INSERT INTO pending_bot_deposits (user_id, method, trx_id, amount) VALUES (?, ?, ?, ?)",
-            (user.id, "sham_usd", trx_id, amount)
-        )
-        dep_id = cursor.lastrowid
-        await db.commit()
-
-    await message.answer(f"جاري معالجة العملية رقم `#{dep_id}` .انتظر قليلا ⏳")
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ موافقة", callback_data=f"bd_yes_{dep_id}"),
-            InlineKeyboardButton(text="❌ رفض", callback_data=f"bd_no_{dep_id}")
-        ]
-    ])
-
-    await notify_next_admin(
-        f"📥 **طلب شحن رصيد بوت جديد (شام كاش دولار) (#`{dep_id}`):**\n\n"
-        f"👤 المشترك: @{user.username or 'بدون'} (`{user.id}`)\n"
-        f"💳 رقم عملية التحويل: {trx_id}\n"
-        f"💵 المبلغ المدخل: {amount} USD",
-        reply_markup=admin_kb
-    )
-
-    await state.clear()
-
-
-@dp.callback_query(F.data.startswith("bd_yes_") | F.data.startswith("bd_no_"))
-async def admin_bot_deposit_decision(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not await is_admin(callback.from_user.id):
-        return
-    data_parts = callback.data.split("_")
-    if len(data_parts) >= 3:
-        action = data_parts[1]
-        dep_id = int(data_parts[2])
-    else:
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id, method, trx_id, amount FROM pending_bot_deposits WHERE id = ?", (dep_id,)) as cur:
-            row = await cur.fetchone()
-        
-        await db.execute("DELETE FROM pending_bot_deposits WHERE id = ?", (dep_id,))
-        await db.commit()
-
-    if action == "yes":
-        if row:
-            uid, method, trx_id, amount = row
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("INSERT OR IGNORE INTO wallets (user_id, balance) VALUES (?, 0.0)", (uid,))
-                await db.execute("UPDATE wallets SET balance = balance + ? WHERE user_id = ?", (amount, uid))
-                await db.commit()
-
-            await log_financial(dep_id, uid, "bot_deposit", amount, "USD" if method == "sham_usd" else "SYP")
-            new_balance = await get_user_balance(uid)
-
-            try:
-                currency_label = "USD" if method == "sham_usd" else "SYP"
-                await bot.send_message(
-                    uid,
-                    f"تم شحن الرصيد الى البوت بنجاح برقم `#{dep_id}` ✅\n\n💵 المبلغ المشحون: {amount} {currency_label}\n💳 رصيد البوت الجديد: {new_balance} SYP"
-                )
-            except Exception:
-                pass
-            try:
-                await callback.message.edit_text(callback.message.text + f"\n\n✅ تمت الموافقة على الإيداع رقم `#{dep_id}` وإضافة الرصيد بنجاح.")
-            except Exception:
-                pass
-        else:
-            await callback.answer("❌ البيانات غير موجودة أو تم التعامل معها مسبقاً.", show_alert=True)
-    else:
-        if row:
-            uid = row[0]
-            try:
-                await bot.send_message(
-                    uid,
-                    f"معلومات التحويل لعملية الإيداع رقم `#{dep_id}` غير صحيحة. تأكد من المعلومات وقم بإرسال الطلب مرة أخرى .🔴"
-                )
-            except Exception:
-                pass
-        try:
-            await callback.message.edit_text(callback.message.text + f"\n\n❌ تم رفض طلب الإيداع رقم `#{dep_id}`.")
-        except Exception:
-            pass
-
-    await callback.answer()
-
-
-# ========================================================
-# === إدارة إنشاء الحسابات ===
-# ========================================================
-@dp.callback_query(F.data == "menu_ichancy_create")
-async def cb_create_account_start(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT ichancy_username, ichancy_password FROM ichancy_accounts WHERE user_id = ?", (user_id,)) as cur:
-            acc_row = await cur.fetchone()
-            if acc_row:
-                acc_usr, acc_pwd = acc_row
-                await callback.message.answer(
-                    f"⚠️ أنت تملك حساب في البوت .\n\n👤 أسم المستخدم : {acc_usr}\n🔑 كلمة المرور : {acc_pwd}"
-                )
-                await callback.answer("لديك حساب مسبق بالفعل!", show_alert=True)
+        if state == "admin_editing_password":
+            if len(text) < 4:
+                bot.send_message(chat_id, "❌ كلمة المرور قصيرة جداً، أرسل كلمة مرور صالحة:")
                 return
+            update_request_password(req_id, text)
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, f"✅ تم تحديث كلمة المرور للطلب #{req_id}.")
+            send_request_to_ola276(req_id)
+            return
 
-        async with db.execute("SELECT acc_username FROM pending_acc_requests WHERE user_id = ?", (user_id,)) as cur:
-            if await cur.fetchone():
-                await callback.answer("⚠️ لديك طلب إنشاء حساب قيد المراجعة لدى الإدارة بالفعل!", show_alert=True)
-                return
+    # 4. معالجة شحن رصيد في الحساب
+    if state == "acc_deposit_waiting_amount":
+        acc = get_active_ichancy_account(user.id)
+        if not acc:
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, "لا يوجد لديك حساب ichancy مفعل بعد.", reply_markup=ichancy_menu_keyboard())
+            return
 
-    await state.set_state(AccountCreationStates.waiting_for_username)
-    await callback.message.edit_text(
-        "👤 إنشاء حساب ichancy جديد:\n\nالرجاء إدخال اسم من 8 أحرف إنجليزية على الأقل وأرقام.\n⚠️ بشرط ألا يحوي على رموز أو مسافات."
-    )
-    await callback.answer()
+        if not ENGLISH_NUMBER_PATTERN.match(text):
+            bot.send_message(
+                chat_id,
+                "يرجى الانتباه الى ضرورة إدخال الارقام باللغة الانكليزية فقط\nأدخل المبلغ المراد شحنه  👇",
+                reply_markup=cancel_to_main_keyboard(),
+            )
+            return
 
+        amount = float(text)
+        if amount < MIN_ACCOUNT_DEPOSIT:
+            bot.send_message(
+                chat_id,
+                f"❌ الحد الأدنى لشحن الحساب هو SYP{format_amount(MIN_ACCOUNT_DEPOSIT)}.\nأدخل المبلغ المراد شحنه  👇",
+                reply_markup=cancel_to_main_keyboard(),
+            )
+            return
 
-@dp.message(AccountCreationStates.waiting_for_username)
-async def process_account_username(message: types.Message, state: FSMContext):
-    # إذا أرسل المستخدم أي أمر يبدأ بـ / في أي وقت، قم بإلغاء الحالة وتنفيذ الأمر فوراً
-    if message.text and message.text.startswith("/"):
-        await state.clear()  # إلغاء الحالة الحالية تماماً
-        
-        if message.text.startswith("/start"):
-            await cmd_start(message, state)
-        elif message.text.startswith("/admin"):
-            await cmd_admin_panel(message, state)
-        else:
-            await message.answer("🔄 تم إلغاء العملية السابقة بناءً على طلبك.")
+        current_balance = ensure_user(user)
+        if amount > current_balance:
+            bot.send_message(
+                chat_id,
+                f"لاتملك رصيد كافي لعملية التحويل, رصيدك الحالي: {format_amount(current_balance)}SYP",
+                reply_markup=cancel_to_main_keyboard(),
+            )
+            return
+
+        set_user_state(user.id, None, None)
+        tr_id = create_account_transfer_request(user.id, "deposit_acc", str(acc["acc_username"]), amount)
+        bot.send_message(chat_id, "يتم معالجة الطلب .الأتصال بالمنصه...⏳")
+        send_account_transfer_request_to_ola276(tr_id)
         return
 
-    username_input = message.text.strip() if message.text else ""
+    # 5. معالجة سحب رصيد من الحساب
+    if state == "acc_withdraw_waiting_amount":
+        acc = get_active_ichancy_account(user.id)
+        if not acc:
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, "لا يوجد لديك حساب ichancy مفعل بعد.", reply_markup=ichancy_menu_keyboard())
+            return
 
-    # التحقق من أن اسم المستخدم يتكون من 8 أحرف إنجليزية وأرقام على الأقل بدون رموز
-    if not re.match(r"^[A-Za-z0-9]{8,}$", username_input):
-        await message.answer(
-            "❌ اسم المستخدم غير صالح!\n"
-            "يجب أن يكون من 8 أحرف إنجليزية وأرقام على الأقل وبدون أي رموز أو مسافات. حاول مجدداً:"
-        )
+        if not ENGLISH_NUMBER_PATTERN.match(text):
+            bot.send_message(
+                chat_id,
+                "يرجى الانتباه الى ضرورة إدخال الارقام باللغة الانكليزية فقط\nاقل مبلغ للسحب SYP200\nأدخل المبلغ المراد سحبه  👇",
+                reply_markup=cancel_to_main_keyboard(),
+            )
+            return
+
+        amount = float(text)
+        if amount < MIN_ACCOUNT_WITHDRAW:
+            bot.send_message(
+                chat_id,
+                "اقل مبلغ للسحب SYP200\nأدخل المبلغ المراد سحبه  👇",
+                reply_markup=cancel_to_main_keyboard(),
+            )
+            return
+
+        set_user_state(user.id, None, None)
+        tr_id = create_account_transfer_request(user.id, "withdraw_acc", str(acc["acc_username"]), amount)
+        bot.send_message(chat_id, "يتم معالجة طلب السحب ..الاتصال بالمنصه .....⏳")
+        send_account_transfer_request_to_ola276(tr_id)
         return
 
-    # حفظ الاسم والانتقال لحالة كلمة المرور
-    await state.update_data(acc_username=username_input)
-    await state.set_state(AccountCreationStates.waiting_for_password)
-    
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 إلغاء", callback_data="main_menu")]])
-    await message.answer(
-        "🔑 أدخل كلمة مرور مناسبة (أحرف إنجليزية وأرقام، بدون رموز):",
-        reply_markup=markup
-    )
-
-
-@dp.message(AccountCreationStates.waiting_for_password)
-async def process_account_password(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ يرجى إدخال كلمة المرور كـ نص:")
-        return
-    text = message.text.strip()
-    
-    if not re.match(r"^[A-Za-z0-9]{6,}$", text):
-        await message.answer("❌ كلمة المرور غير صالحة!\nيجب أن تتكون من أحرف إنجليزية وأرقام فقط وبدون رموز (6 محاور أو أكثر). حاول مجدداً:")
+    # 6. سحب رصيد البوت عبر شام كاش دولار
+    if state == "wdr_sham_usd_waiting_code":
+        if not text:
+            bot.send_message(chat_id, "ادخل كود الشام كاش الخاص بك\n\nالحد الادنى للسحب هو: SYP 2,000.00", reply_markup=cancel_to_main_keyboard())
+            return
+        set_user_state(user.id, "wdr_sham_usd_waiting_amount", text)
+        bot.send_message(chat_id, "أدخل المبلغ المراد سحبه 👇\nعلماً أن الحد الادنى للسحب هو: SYP 2,000.00", reply_markup=cancel_to_main_keyboard())
         return
 
-    data = await state.get_data()
-    acc_username = data.get("acc_username")
-    acc_password = text
-    user = message.from_user
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO pending_acc_requests (user_id, acc_username, acc_password) VALUES (?, ?, ?)",
-            (user.id, acc_username, acc_password)
-        )
-        await db.commit()
-
-    await message.answer("يتم إنشاء حساب جديد .يرجى الانتظار ⏳")
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ موافقة وإرسال", callback_data=f"acc_yes_{user.id}"),
-            InlineKeyboardButton(text="❌ رفض", callback_data=f"acc_no_{user.id}")
-        ],
-        [
-            InlineKeyboardButton(text="✏️ تعديل الاسم", callback_data=f"edit_acc_usr_{user.id}"),
-            InlineKeyboardButton(text="🔑 تعديل كلمة المرور", callback_data=f"edit_acc_pwd_{user.id}")
-        ]
-    ])
-
-    await notify_next_admin(
-        f"📥 طلب إنشاء حساب ichancy جديد:\n\n"
-        f"👤 صاحب الحساب: @{user.username or 'بدون'} ({user.id})\n"
-        f"🏷️ اسم المستخدم المقترح: {acc_username}\n"
-        f"🔑 كلمة المرور المقترحة: {acc_password}",
-        reply_markup=admin_kb
-    )
-
-    await state.clear()
-
-
-@dp.callback_query(F.data.startswith("acc_yes_") | F.data.startswith("acc_no_"))
-async def admin_acc_decision(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not await is_admin(callback.from_user.id):
-        return
-    parts = callback.data.split("_")
-    if len(parts) >= 3:
-        action, uid = parts[1], int(parts[2])
-    else:
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT acc_username, acc_password FROM pending_acc_requests WHERE user_id = ?", (uid,)) as cur:
-            row = await cur.fetchone()
-        
-        await db.execute("DELETE FROM pending_acc_requests WHERE user_id = ?", (uid,))
-        await db.commit()
-
-    if action == "yes":
-        if row:
-            u_name, u_pwd = row
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("INSERT OR REPLACE INTO ichancy_accounts (user_id, ichancy_username, ichancy_password) VALUES (?, ?, ?)", (uid, u_name, u_pwd))
-                await db.commit()
-
-            try:
-                await bot.send_message(
-                    uid,
-                    f"🎉 تم قبول وتفعيل حسابك بنجاح!\n\n👤 أسم المستخدم: {u_name}\n🔑 كلمة المرور : {u_pwd}"
-                )
-            except Exception:
-                pass
-            try:
-                await callback.message.edit_text(callback.message.text + "\n\n✅ تمت الموافقة وإرسال البيانات للمستخدم.")
-            except Exception:
-                pass
-        else:
-            await callback.answer("❌ البيانات غير موجودة أو تم التعامل معها مسبقاً.", show_alert=True)
-    else:
+    if state == "wdr_sham_usd_waiting_amount":
+        current_balance = ensure_user(user)
         try:
-            await bot.send_message(uid, "❌ عذراً، تم رفض طلب إنشاء حساب ichancy الخاص بك من قبل الإدارة.")
-        except Exception:
-            pass
-        try:
-            await callback.message.edit_text(callback.message.text + "\n\n❌ تم رفض الطلب.")
-        except Exception:
-            pass
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("edit_acc_usr_") | F.data.startswith("edit_acc_pwd_"))
-async def admin_start_edit_field(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        return
-    parts = callback.data.split("_")
-    if len(parts) >= 4:
-        field_type = parts[2]
-        uid = int(parts[3])
-    else:
-        return
-
-    await state.set_state(AdminEditStates.editing_username if field_type == "usr" else AdminEditStates.editing_password)
-    await state.update_data(target_uid=uid, msg_id=callback.message.message_id)
-    
-    field_name = "اسم المستخدم الجديد" if field_type == "usr" else "كلمة المرور الجديدة"
-    await callback.message.answer(f"✍️ أرسل {field_name} للمستخدم ({uid}):")
-    await callback.answer()
-
-
-@dp.message(AdminEditStates.editing_username)
-async def admin_save_edited_username(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
-    if not message.text:
-        await message.answer("❌ يرجى إرسال نص صالح:")
-        return
-    new_value = message.text.strip()
-    data = await state.get_data()
-    uid = data.get("target_uid")
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE pending_acc_requests SET acc_username = ? WHERE user_id = ?", (new_value, uid))
-        await db.commit()
-        
-        async with db.execute("SELECT acc_username, acc_password FROM pending_acc_requests WHERE user_id = ?", (uid,)) as cur:
-            row = await cur.fetchone()
-
-    if row:
-        u_name, u_pwd = row
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ موافقة وإرسال", callback_data=f"acc_yes_{uid}"),
-                InlineKeyboardButton(text="❌ رفض", callback_data=f"acc_no_{uid}")
-            ],
-            [
-                InlineKeyboardButton(text="✏️ تعديل الاسم", callback_data=f"edit_acc_usr_{uid}"),
-                InlineKeyboardButton(text="🔑 تعديل كلمة المرور", callback_data=f"edit_acc_pwd_{uid}")
-            ]
-        ])
-        await message.answer(
-            f"✅ تم تحديث اسم المستخدم بنجاح! الطلب المحدث:\n\n👤 صاحب الحساب: ({uid})\n🏷️ اسم المستخدم: {u_name}\n🔑 كلمة المرور: {u_pwd}",
-            reply_markup=admin_kb
-        )
-    else:
-        await message.answer("❌ عذراً، لم يتم العثور على الطلب المعلق.")
-
-    await state.clear()
-
-
-@dp.message(AdminEditStates.editing_password)
-async def admin_save_edited_password(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
-    if not message.text:
-        await message.answer("❌ يرجى إرسال نص صالح:")
-        return
-    new_value = message.text.strip()
-    data = await state.get_data()
-    uid = data.get("target_uid")
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE pending_acc_requests SET acc_password = ? WHERE user_id = ?", (new_value, uid))
-        await db.commit()
-        
-        async with db.execute("SELECT acc_username, acc_password FROM pending_acc_requests WHERE user_id = ?", (uid,)) as cur:
-            row = await cur.fetchone()
-
-    if row:
-        u_name, u_pwd = row
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ موافقة وإرسال", callback_data=f"acc_yes_{uid}"),
-                InlineKeyboardButton(text="❌ رفض", callback_data=f"acc_no_{uid}")
-            ],
-            [
-                InlineKeyboardButton(text="✏️ تعديل الاسم", callback_data=f"edit_acc_usr_{uid}"),
-                InlineKeyboardButton(text="🔑 تعديل كلمة المرور", callback_data=f"edit_acc_pwd_{uid}")
-            ]
-        ])
-        await message.answer(
-            f"✅ تم تحديث كلمة المرور بنجاح! الطلب المحدث:\n\n👤 صاحب الحساب: ({uid})\n🏷️ اسم المستخدم: {u_name}\n🔑 كلمة المرور: {u_pwd}",
-            reply_markup=admin_kb
-        )
-    else:
-        await message.answer("❌ عذراً، لم يتم العثور على الطلب المعلق.")
-
-    await state.clear()
-
-
-# ========================================================
-# === التشغيل الأساسي للبوت ===
-# ========================================================
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    
-    bot_status = await fetch_setting("bot_status")
-    if bot_status == "stopped" and not await is_admin(message.from_user.id):
-        await message.answer("🔴 عذراً، البوت متوقف حالياً للصيانة من قبل الإدارة.")
-        return
-
-    user = message.from_user
-    username = user.username or "NoUsername"
-    
-    args = message.text.split() if message.text else []
-    referred_by = None
-    if len(args) > 1 and args[1].startswith("ref_"):
-        try:
-            referred_by = int(args[1].replace("ref_", ""))
+            amount = float(text.replace(",", ".").strip())
         except ValueError:
-            pass
-
-    await register_user_if_new(user.id, username, referred_by)
-    
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT agreed FROM user_agreements WHERE user_id = ?", (user.id,)) as cursor:
-            row = await cursor.fetchone()
-            has_agreed = row[0] if row else 0
-
-    if not has_agreed:
-        welcome_text = await fetch_setting("welcome_message")
-        terms_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ أوافق على الشروط والأحكام", callback_data="agree_terms")],
-            [InlineKeyboardButton(text="📢 الانضمام لقناة البوت", url="https://t.me/ichancynor")]
-        ])
-        await message.answer(welcome_text, reply_markup=terms_kb)
-        return
-
-    if not await verify_subscription(bot, user.id):
-        channel = await fetch_setting("channel_username")
-        sub_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 انضم للقناة الآن", url=f"https://t.me/{channel.replace('@', '')}")],
-            [InlineKeyboardButton(text="🔄 تحقق من الاشتراك", callback_data="go_main")]
-        ])
-        await message.answer(f"⚠️ عذراً، يجب عليك الاشتراك في قناتنا الرسمية ({channel}) أولاً لتشغيل البوت.", reply_markup=sub_kb)
-        return
-
-    await message.answer(
-        "🌸 أهلاً بك. تم تفعيل حسابك بنجاح.\nيمكنك استخدام الأزرار أدناه للتحكم الكامل بالخدمات."
-    )
-
-
-@dp.callback_query(F.data == "agree_terms")
-async def cb_agree_terms(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO user_agreements (user_id, agreed) VALUES (?, 1)", (user_id,))
-        await db.commit()
-        
-    await callback.message.edit_text(
-        "✅ تمت الموافقة على الشروط والأحكام بنجاح!\n\nالخطوة التالية:\nيرجى التأكد من انضمامك إلى قناتنا الرسمية (`@ichancynor`) ثم اضغط على زر التحقق أدناه.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 قناة البوت", url="https://t.me/ichancynor")],
-            [InlineKeyboardButton(text="✅ تحقق من الاشتراك والبدء", callback_data="go_main")]
-        ])
-    )
-    await callback.answer("شكراً لموافقتك على الشروط!", show_alert=True)
-
-
-@dp.callback_query(F.data == "go_main")
-async def cb_go_main(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user = callback.from_user
-    if not await verify_subscription(bot, user.id):
-        await callback.answer("عذراً، لم تقم بالاشتراك بالقناة بعد!", show_alert=True)
-        return
-
-    balance = await get_user_balance(user.id)
-    text = (
-        f"🤖 لوحة تحكم الخدمات:\n\n"
-        f"💳 الرصيد الحالي: {balance} SYP\n"
-        f"🆔 أيدي حسابك: {user.id}"
-    )
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    await callback.message.answer(text, reply_markup=get_dashboard_keyboard())
-    await callback.answer()
-
-
-@dp.message(Command("run_bot"))
-async def cmd_run_bot(message: types.Message, state: FSMContext):
-    await state.clear()
-    user = message.from_user
-    if not await verify_subscription(bot, user.id):
-        await message.answer("⚠️ عذراً، يجب الاشتراك في قناة البوت أولاً.")
-        return
-
-    balance = await get_user_balance(user.id)
-    text = (
-        f"🤖 لوحة تحكم الخدمات:\n\n"
-        f"💳 الرصيد الحالي: {balance} SYP\n"
-        f"🆔 أيدي حسابك: {user.id}"
-    )
-    await message.answer(text, reply_markup=get_dashboard_keyboard())
-
-
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    await init_database()
-    
-    await bot.set_my_commands([
-        BotCommand(command="run_bot", description="🚀 القائمة الرئيسية")
-    ])
-    
-    try:
-        await bot.set_my_commands(
-            commands=[
-                BotCommand(command="run_bot", description="🚀 القائمة الرئيسية"),
-                BotCommand(command="admin", description="👑 لوحة تحكم المشرف")
-            ],
-            scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+            bot.send_message(chat_id, "❌ يرجى إدخال مبلغ صحيح بالأرقام.", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount < MIN_WITHDRAW_SHAM_CASH:
+            bot.send_message(chat_id, "❌ المبلغ أقل من الحد الأدنى للسحب (SYP 2,000.00).", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount > current_balance:
+            bot.send_message(chat_id, f"لاتملك رصيد كافي لعملية السحب, رصيدك الحالي: {format_amount(current_balance)}SYP", reply_markup=cancel_to_main_keyboard())
+            return
+        sham_code = temp_data or ""
+        set_user_state(user.id, None, None)
+        comm_rate = get_withdraw_commission_rate()
+        wdr_usd_rate = get_withdraw_usd_rate_syp()
+        commission_syp = round(amount * comm_rate, 2)
+        net_syp = round(amount - commission_syp, 2)
+        net_usd = round(net_syp / wdr_usd_rate, 2)
+        w_id = create_bot_withdraw_request(user.id, "شام كاش دولار 💲", sham_code, amount, commission_syp, net_usd)
+        bot.send_message(
+            chat_id,
+            f"طلب السحب رقم {w_id}\n"
+            f"الرقم المرسل اليه : {sham_code}\n"
+            f"المبلغ المسحوب كامل : {format_amount(amount)}SYP\n"
+            f"عموله {int(round(comm_rate * 100))}٪ على مبلغ السحب : {format_amount(commission_syp)}SYP\n"
+            f"كل {format_amount(wdr_usd_rate)}SYP. =1USD\n"
+            f"صافي المبلغ بعد خصم العموله : {format_amount(net_usd)}USD",
         )
-    except Exception as e:
-        logging.warning(f"Could not set admin scope commands: {e}")
-    
-    print("🤖 جاري تشغيل البوت بنجاح مع تفعيل نظام توزيع الطلبات بالدور وعمولة السحب...")
-    await dp.start_polling(bot)
+        send_withdraw_request_to_ola276(w_id)
+        return
+
+    # 7. سحب رصيد البوت عبر سريتيل كاش
+    if state == "wdr_syriatel_waiting_phone":
+        if not text:
+            bot.send_message(chat_id, "أدخل الرقم المراد التحويل اليه", reply_markup=cancel_to_main_keyboard())
+            return
+        set_user_state(user.id, "wdr_syriatel_waiting_amount", text)
+        bot.send_message(chat_id, "أدخل المبلغ المراد سحبه 👇\nالحد الادنى للسحب هو: SYP 250.00\nالحد الاعلى للسحب هو: SYP 5,000,000.00", reply_markup=cancel_to_main_keyboard())
+        return
+
+    if state == "wdr_syriatel_waiting_amount":
+        current_balance = ensure_user(user)
+        try:
+            amount = float(text.replace(",", ".").strip())
+        except ValueError:
+            bot.send_message(chat_id, "❌ يرجى إدخال مبلغ صحيح بالأرقام.", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount < MIN_WITHDRAW_SYRIATEL or amount > MAX_WITHDRAW_SYRIATEL:
+            bot.send_message(chat_id, "❌ المبلغ خارج الحدود المسموحة للسحب.", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount > current_balance:
+            bot.send_message(chat_id, f"لاتملك رصيد كافي لعملية السحب, رصيدك الحالي: {format_amount(current_balance)}SYP", reply_markup=cancel_to_main_keyboard())
+            return
+        phone_number = temp_data or ""
+        set_user_state(user.id, None, None)
+        comm_rate = get_withdraw_commission_rate()
+        commission = round(amount * comm_rate, 2)
+        net_amount = round(amount - commission, 2)
+        w_id = create_bot_withdraw_request(user.id, "سريتيل كاش 🪙", phone_number, amount, commission, net_amount)
+        bot.send_message(
+            chat_id,
+            f"طلب السحب رقم {w_id}\n"
+            f"الرقم المرسل اليه : {phone_number}\n"
+            f"المبلغ المسحوب كامل : {format_amount(amount)}SYP\n"
+            f"عموله {int(round(comm_rate * 100))}٪ على مبلغ السحب : {format_amount(commission)}SYP\n"
+            f"صافي المبلغ بعد خصم العموله : {format_amount(net_amount)}SYP",
+        )
+        send_withdraw_request_to_ola276(w_id)
+        return
+
+    # 8. سحب رصيد البوت عبر شام كاش سوري
+    if state == "wdr_sham_syp_waiting_code":
+        if not text:
+            bot.send_message(chat_id, "ادخل كود الشام كاش الخاص بك", reply_markup=cancel_to_main_keyboard())
+            return
+        set_user_state(user.id, "wdr_sham_syp_waiting_amount", text)
+        bot.send_message(chat_id, "أدخل المبلغ المراد سحبه 👇\nالحد الادنى للسحب هو: SYP 2,000.00", reply_markup=cancel_to_main_keyboard())
+        return
+
+    if state == "wdr_sham_syp_waiting_amount":
+        current_balance = ensure_user(user)
+        try:
+            amount = float(text.replace(",", ".").strip())
+        except ValueError:
+            bot.send_message(chat_id, "❌ يرجى إدخال مبلغ صحيح بالأرقام.", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount < MIN_WITHDRAW_SHAM_CASH:
+            bot.send_message(chat_id, "❌ المبلغ أقل من الحد الأدنى للسحب (SYP 2,000.00).", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount > current_balance:
+            bot.send_message(chat_id, f"لاتملك رصيد كافي لعملية السحب, رصيدك الحالي: {format_amount(current_balance)}SYP", reply_markup=cancel_to_main_keyboard())
+            return
+        sham_code = temp_data or ""
+        set_user_state(user.id, None, None)
+        comm_rate = get_withdraw_commission_rate()
+        commission = round(amount * comm_rate, 2)
+        net_amount = round(amount - commission, 2)
+        w_id = create_bot_withdraw_request(user.id, "شام كاش سوري 💵", sham_code, amount, commission, net_amount)
+        bot.send_message(
+            chat_id,
+            f"طلب السحب رقم {w_id}\n"
+            f"الرقم المرسل اليه : {sham_code}\n"
+            f"المبلغ المسحوب كامل : {format_amount(amount)}SYP\n"
+            f"عموله {int(round(comm_rate * 100))}٪ على مبلغ السحب : {format_amount(commission)}SYP\n"
+            f"صافي المبلغ بعد خصم العموله : {format_amount(net_amount)}SYP",
+        )
+        send_withdraw_request_to_ola276(w_id)
+        return
+
+    # 9. شحن رصيد البوت عبر شام كاش دولار
+    if state == "dep_sham_usd_waiting_tx":
+        if not text:
+            bot.send_message(chat_id, "يرجى إدخال رقم العملية:", reply_markup=cancel_to_main_keyboard())
+            return
+        set_user_state(user.id, "dep_sham_usd_waiting_amount", text)
+        bot.send_message(chat_id, "أدخل المبلغ المراد شحنه 👇", reply_markup=cancel_to_main_keyboard())
+        return
+
+    if state == "dep_sham_usd_waiting_amount":
+        try:
+            amount = float(text.replace(",", ".").strip())
+        except ValueError:
+            bot.send_message(chat_id, "❌ يرجى إدخال مبلغ صحيح بالأرقام.", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount <= 0:
+            bot.send_message(chat_id, "❌ يرجى إدخال مبلغ أكبر من صفر.", reply_markup=cancel_to_main_keyboard())
+            return
+        tx_number = temp_data or ""
+        set_user_state(user.id, None, None)
+        ensure_user(user)
+        dep_id = create_bot_deposit_request(user.id, "شام كاش دولار 💲", amount, tx_number)
+        bot.send_message(chat_id, "جار معالجة العملية يرجى الانتظار ⌛️")
+        send_deposit_request_to_ola276(dep_id)
+        return
+
+    # 10. شحن رصيد البوت عبر شام كاش سوري
+    if state == "dep_sham_syp_waiting_tx":
+        if not text:
+            bot.send_message(chat_id, "يرجى إدخال رقم العملية:", reply_markup=cancel_to_main_keyboard())
+            return
+        set_user_state(user.id, "dep_sham_syp_waiting_amount", text)
+        bot.send_message(chat_id, "أدخل المبلغ المراد شحنه 👇", reply_markup=cancel_to_main_keyboard())
+        return
+
+    if state == "dep_sham_syp_waiting_amount":
+        try:
+            amount = float(text.replace(",", ".").strip())
+        except ValueError:
+            bot.send_message(chat_id, "❌ يرجى إدخال مبلغ صحيح بالأرقام.", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount < MIN_SHAM_CASH_SYP_AMOUNT:
+            bot.send_message(chat_id, "❌ المبلغ أقل من الحد الأدنى (SYP 200.00).", reply_markup=cancel_to_main_keyboard())
+            return
+        tx_number = temp_data or ""
+        set_user_state(user.id, None, None)
+        ensure_user(user)
+        dep_id = create_bot_deposit_request(user.id, "شام كاش سوري 💵", amount, tx_number)
+        bot.send_message(chat_id, "جار معالجة العملية يرجى الانتظار ⌛️")
+        send_deposit_request_to_ola276(dep_id)
+        return
+
+    # 11. شحن رصيد البوت عبر سيرياتيل كاش
+    if state == "dep_syriatel_waiting_amount":
+        try:
+            amount = float(text.replace(",", ".").strip())
+        except ValueError:
+            bot.send_message(chat_id, "❌ يرجى إدخال مبلغ صحيح بالأرقام (الحد الأدنى: 200 ليرة سورية جديدة):", reply_markup=cancel_to_main_keyboard())
+            return
+        if amount < MIN_SYRIATEL_AMOUNT:
+            bot.send_message(chat_id, "❌ المبلغ أقل من الحد الأدنى (200 ليرة سورية جديدة).", reply_markup=cancel_to_main_keyboard())
+            return
+        amount_str = format_amount(amount)
+        set_user_state(user.id, "dep_syriatel_waiting_tx", amount_str)
+        bot.send_message(
+            chat_id,
+            "📱 شحن عبر سيرياتيل كاش\n\n"
+            f"المبلغ المطلوب: {amount_str}SYP جديدة\n\n"
+            "🔑 الكود السري:\n"
+            f"<code>{get_syriatel_code()}</code>\n\n"
+            "انتباه:حوّل المبلغ إلى هذا الكود بطريقة التحويل اليدوي.\n"
+            "بعد التحويل أرسل رقم العملية هنا.",
+            reply_markup=cancel_to_main_keyboard(),
+        )
+        return
+
+    if state == "dep_syriatel_waiting_tx":
+        if not text:
+            bot.send_message(chat_id, "يرجى إرسال رقم العملية هنا:", reply_markup=cancel_to_main_keyboard())
+            return
+        amount = float(temp_data or MIN_SYRIATEL_AMOUNT)
+        set_user_state(user.id, None, None)
+        ensure_user(user)
+        dep_id = create_bot_deposit_request(user.id, "سريتيل كاش 🪙", amount, text)
+        bot.send_message(chat_id, "يتم معالجة الامر.... ⏳")
+        send_deposit_request_to_ola276(dep_id)
+        return
+
+    # 12. إنشاء حساب ichancy
+    if state == "ichancy_waiting_username":
+        if get_active_ichancy_account(user.id):
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, "لايمكن انشاء حساب أخر لديك حساب مفعل 🌸", reply_markup=ichancy_menu_keyboard())
+            return
+        if not USERNAME_PATTERN.match(text):
+            bot.send_message(
+                chat_id,
+                "أدخل الاسم بشرط ان لا يقل عن ثماني احرف انجليزيه صغيره وأحرف (بدون رموز )👇",
+                reply_markup=cancel_to_main_keyboard(),
+            )
+            return
+        set_user_state(user.id, "ichancy_waiting_password", text)
+        bot.send_message(chat_id, "ادخل كلمة المرور لحسابك 👇", reply_markup=cancel_to_main_keyboard())
+        return
+
+    if state == "ichancy_waiting_password":
+        if get_active_ichancy_account(user.id):
+            set_user_state(user.id, None, None)
+            bot.send_message(chat_id, "لايمكن انشاء حساب أخر لديك حساب مفعل 🌸", reply_markup=ichancy_menu_keyboard())
+            return
+        if len(text) < 4:
+            bot.send_message(chat_id, "يرجى إدخال كلمة مرور صالحة (4 أحرف أو أرقام على الأقل):\nادخل كلمة المرور لحسابك 👇", reply_markup=cancel_to_main_keyboard())
+            return
+        acc_username = temp_data or ""
+        acc_password = text
+        set_user_state(user.id, None, None)
+        req_id = create_account_request(user.id, acc_username, acc_password)
+        bot.send_message(chat_id, "يتم إنشاء الحساب الاتصال بالخادم ⏳")
+        send_request_to_ola276(req_id)
+        return
+
+    # 13. الأوامر النصية العامة والاحتفاظ بالتحقق الإجباري
+    if text in {"أبدء", "ابدأ"}:
+        send_start_response(chat_id, user, remove_reply_kb=False)
+    elif text == "رصيدي":
+        send_balance_response(chat_id, user)
+    elif text in {"لوحة التحكم", "لوحة تحكم"} and is_main_admin(user):
+        send_admin_panel(chat_id)
+    else:
+        first_time = is_first_time_user(user.id)
+        ensure_user(user)
+        if first_time or not is_user_subscribed(user.id):
+            send_force_sub_message(chat_id, is_new_user=first_time)
+        else:
+            bot.send_message(
+                chat_id,
+                "اضغط على زر القائمة في الشريط السفلي لاختيار <b>أبدء</b> أو <b>رصيدي</b>.",
+            )
+
+
+def run_bot():
+    """تهيئة قاعدة البيانات وتشغيل البوت."""
+    init_db()
+    bot_info = bot.get_me()
+    print(f"Database ready at: {DB_PATH}")
+    print(f"Force-sub channel: {get_channel_username()} ({get_channel_url()})")
+    print(f"Sole Main Admin: @{ADMIN_USERNAME} (Chat ID: {get_ola276_chat_id()})")
+    print(f"Bot running: @{bot_info.username} (ID: {bot_info.id})")
+    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_bot()
