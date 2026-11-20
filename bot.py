@@ -1,14 +1,404 @@
-كن وكيلاً معنا بأبسط طريقة
-إحصل على نسبة ثابتة لكل عمليات الشحن والتعبئة القادمة عن طريق رابط احالتك ضمن البوت
+import os
+import re
+import sqlite3
+from datetime import datetime
+import telebot
+from telebot.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    MenuButtonCommands,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove,
+)
 
-رابط الاحالة الخاص بك:
-https://t.me/Ichancy_Gem_Bot?start=255308383
+# قراءة الإعدادات من متغيرات البيئة مع قيم افتراضية للاختبار المحلي
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9038004780:AAG5HYm4at5yOq8VIVnbB8gaLU0OJE5C9Hk")
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+DEFAULT_CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/ichancyadam")
+DEFAULT_CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@ichancyadam")
 
-إجمالي الإحالات: 0
-الإحالات النشطة: 0
+# تعيين المشرف الجديد والرئيسي الوحيد Ola276
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Ola276").lstrip("@").strip()
+ENV_ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+MAX_SECONDARY_ADMINS = 5
 
-مدة حساب الارباح: 10 يوم/أيام
-المدة المتبقية على توزيع الارباح: 10 يوم/أيامstrftime("%Y-%m-%d %H:%M:%S")
+# إعدادات طرق الشحن الافتراضية
+DEFAULT_SYRIATEL_CODE = os.getenv("SYRIATEL_CODE", "0933380467")
+MIN_SYRIATEL_AMOUNT = 200.0
+
+DEFAULT_SHAM_CASH_SYP_CODE = os.getenv(
+    "SHAM_CASH_SYP_CODE",
+    "658544223c0e72faa9776f6a22cbfeba",
+)
+MIN_SHAM_CASH_SYP_AMOUNT = 200.0
+
+DEFAULT_SHAM_CASH_USD_CODE = os.getenv(
+    "SHAM_CASH_USD_CODE",
+    "658544223c0e72faa9776f6a22cbfeba",
+)
+DEFAULT_SHAM_CASH_USD_RATE_SYP = 142.0
+
+# إعدادات سحب الرصيد من البوت الافتراضية
+MIN_WITHDRAW_SYRIATEL = 250.0
+MAX_WITHDRAW_SYRIATEL = 5000000.0
+MIN_WITHDRAW_SHAM_CASH = 2000.0
+DEFAULT_WITHDRAW_COMMISSION_RATE = 0.10
+DEFAULT_WITHDRAW_USD_RATE_SYP = 145.0
+
+# إعدادات شحن وسحب رصيد الحساب في المنصة
+MIN_ACCOUNT_DEPOSIT = 200.0
+MIN_ACCOUNT_WITHDRAW = 200.0
+
+DEFAULT_WELCOME_MESSAGE = (
+    "مرحبا بك معنا 🌸\n\n"
+    "للاستمرار واستخدام البوت، يرجى الاشتراك في قناة البوت أولاً ثم الضغط على "
+    "<b>التاكد من الاشتراك ✅</b>:"
+)
+
+# تعريف الأزرار القابلة لتخصيص الرسائل والصور
+CUSTOMIZABLE_BUTTONS: list[tuple[str, str]] = [
+    ("btn_ichancy", "⚡ichancy ⚡"),
+    ("btn_deposit_bot", "شحن رصيد الى البوت ⬇️"),
+    ("btn_withdraw_bot", "سحب رصيد من البوت ⬆️"),
+    ("btn_deposit_acc", "شحن رصيد في الحساب 🔽"),
+    ("btn_withdraw_acc", "سحب رصيد من الحساب 🔼"),
+    ("btn_logs", "السجلات 🗃️"),
+    ("btn_support", "التواصل مع الدعم 📩"),
+    ("btn_offers", "العروض الحاليه 🎁"),
+    ("btn_terms", "الشروط والاحكام 📝"),
+    ("btn_lottery", "الياناصيب الاسبوعي💵"),
+]
+BUTTON_KEY_TO_TITLE = dict(CUSTOMIZABLE_BUTTONS)
+
+# شرط الاسم: 8 أحرف إنجليزية صغيرة على الأقل وأحرف فقط بدون رموز أو أرقام أو مسافات
+USERNAME_PATTERN = re.compile(r"^[a-z]{8,}$")
+# شرط الأرقام الإنجليزية فقط (صحيحة أو عشرية بنقطة إنجليزية)
+ENGLISH_NUMBER_PATTERN = re.compile(r"^\d+(?:\.\d+)?$")
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+
+def get_connection() -> sqlite3.Connection:
+    """إنشاء اتصال بقاعدة بيانات SQLite."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """إنشاء الجداول المطلوبة في قاعدة البيانات إذا لم تكن موجودة."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                balance REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_states (
+                user_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                temp_data TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ichancy_accounts (
+                user_id INTEGER PRIMARY KEY,
+                acc_username TEXT NOT NULL,
+                acc_password TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                acc_username TEXT NOT NULL,
+                acc_password TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_deposit_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                amount REAL NOT NULL,
+                tx_number TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_withdraw_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                amount REAL NOT NULL,
+                commission REAL NOT NULL,
+                net_amount REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_transfer_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                transfer_type TEXT NOT NULL,
+                acc_username TEXT NOT NULL,
+                amount REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                message_type TEXT NOT NULL,
+                content_text TEXT,
+                photo_file_id TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS button_configs (
+                button_key TEXT PRIMARY KEY,
+                custom_message TEXT,
+                photo_file_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS secondary_admins (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                added_at TEXT NOT NULL
+            )
+            """
+        )
+        if ENV_ADMIN_CHAT_ID.isdigit():
+            conn.execute(
+                """
+                INSERT INTO bot_settings (key, value)
+                VALUES ('ola276_chat_id', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (ENV_ADMIN_CHAT_ID,),
+            )
+        conn.commit()
+
+
+def set_setting(key: str, value: str):
+    """حفظ قيمة إعداد في قاعدة البيانات."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    """قراءة قيمة إعداد من قاعدة البيانات."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row["value"] if row else default
+
+
+def get_welcome_message() -> str:
+    val = get_setting("welcome_message")
+    return val if (val and val.strip()) else DEFAULT_WELCOME_MESSAGE
+
+
+def is_distribution_enabled() -> bool:
+    return (get_setting("distribute_requests", "on") or "on").strip().lower() == "on"
+
+
+def toggle_distribution_mode() -> bool:
+    current = is_distribution_enabled()
+    new_val = "off" if current else "on"
+    set_setting("distribute_requests", new_val)
+    return new_val == "on"
+
+
+def list_secondary_admins() -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM secondary_admins ORDER BY added_at ASC, user_id ASC"
+        ).fetchall()
+
+
+def is_secondary_admin(user_id: int) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM secondary_admins WHERE user_id = ?",
+            (int(user_id),),
+        ).fetchone()
+        return row is not None
+
+
+def add_secondary_admin(user_id: int, username: str | None, first_name: str | None) -> tuple[bool, str]:
+    ola_id = get_ola276_chat_id()
+    if ola_id is not None and int(user_id) == int(ola_id):
+        return False, "هذا الحساب هو المشرف الرئيسي بالفعل."
+    if is_secondary_admin(user_id):
+        return False, "هذا الحساب معيّن كمشرف ثانوي مسبقاً."
+    sec_list = list_secondary_admins()
+    if len(sec_list) >= MAX_SECONDARY_ADMINS:
+        return False, f"تم الوصول للحد الأقصى للمشرفين الثانويين ({MAX_SECONDARY_ADMINS})."
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO secondary_admins (user_id, username, first_name, added_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(user_id), username, first_name, now_str),
+        )
+        conn.commit()
+    return True, f"✅ تم تعيين المشرف الثانوي بنجاح (الآيدي: <code>{user_id}</code>)."
+
+
+def remove_secondary_admin(user_id: int) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM secondary_admins WHERE user_id = ?", (int(user_id),))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_channel_username() -> str:
+    val = (get_setting("channel_username", DEFAULT_CHANNEL_USERNAME) or DEFAULT_CHANNEL_USERNAME).strip()
+    return val if val.startswith("@") else f"@{val}"
+
+
+def get_channel_url() -> str:
+    val = (get_setting("channel_url", DEFAULT_CHANNEL_URL) or DEFAULT_CHANNEL_URL).strip()
+    if val.startswith("http://") or val.startswith("https://"):
+        return val
+    clean_u = val.lstrip("@")
+    return f"https://t.me/{clean_u}"
+
+
+def get_syriatel_code() -> str:
+    return (get_setting("syriatel_code", DEFAULT_SYRIATEL_CODE) or DEFAULT_SYRIATEL_CODE).strip()
+
+
+def get_sham_cash_syp_code() -> str:
+    return (get_setting("sham_cash_syp_code", DEFAULT_SHAM_CASH_SYP_CODE) or DEFAULT_SHAM_CASH_SYP_CODE).strip()
+
+
+def get_sham_cash_usd_code() -> str:
+    return (get_setting("sham_cash_usd_code", DEFAULT_SHAM_CASH_USD_CODE) or DEFAULT_SHAM_CASH_USD_CODE).strip()
+
+
+def get_sham_cash_usd_rate_syp() -> float:
+    raw = get_setting("sham_cash_usd_rate_syp")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return DEFAULT_SHAM_CASH_USD_RATE_SYP
+
+
+def get_withdraw_usd_rate_syp() -> float:
+    raw = get_setting("withdraw_usd_rate_syp")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return DEFAULT_WITHDRAW_USD_RATE_SYP
+
+
+def get_withdraw_commission_rate() -> float:
+    raw = get_setting("withdraw_commission_rate")
+    if raw:
+        try:
+            val = float(raw)
+            if 0.0 <= val < 1.0:
+                return val
+        except ValueError:
+            pass
+    return DEFAULT_WITHDRAW_COMMISSION_RATE
+
+
+def get_button_config(button_key: str) -> sqlite3.Row | None:
+    """جلب إعدادات الرسالة والصورة المخصصة لزر معين."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM button_configs WHERE button_key = ?",
+            (button_key,),
+        ).fetchone()
+
+
+def save_button_message(button_key: str, custom_message: str | None):
+    """حفظ أو مسح رسالة مخصصة لزر معين."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    existing = get_button_config(button_key)
+    photo_id = existing["photo_file_id"] if existing else None
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO button_configs (button_key, custom_message, photo_file_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(button_key) DO UPDATE SET
+                custom_message = excluded.custom_message,
+                updated_at = excluded.updated_at
+            """,
+            (button_key, custom_message, photo_id, now_str),
+        )
+        conn.commit()
+
+
+def save_button_photo(button_key: str, photo_file_id: str | None):
+    """حفظ أو حذف صورة مخصصة لزر معين."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     existing = get_button_config(button_key)
     custom_msg = existing["custom_message"] if existing else None
     with get_connection() as conn:
@@ -628,17 +1018,16 @@ def is_first_time_user(user_id: int) -> bool:
         return row is None
 
 
-def ensure_user(user, referred_by: int | None = None) -> float:
-    """إضافة المستخدم إذا لم يكن مسجلاً (مع تسجيل المُحيل إن وُجد) وإرجاع رصيده الحالي."""
+def ensure_user(user) -> float:
+    """إضافة المستخدم إذا لم يكن مسجلاً وإرجاع رصيده الحالي."""
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    clean_ref = referred_by if (referred_by and int(referred_by) != int(user.id)) else None
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO users (user_id, username, first_name, balance, referred_by, cycle_start, created_at)
-            VALUES (?, ?, ?, 0.0, ?, ?, ?)
+            INSERT OR IGNORE INTO users (user_id, username, first_name, balance, created_at)
+            VALUES (?, ?, ?, 0.0, ?)
             """,
-            (user.id, user.username, user.first_name, clean_ref, now_str, now_str),
+            (user.id, user.username, user.first_name, now_str),
         )
         conn.execute(
             """
@@ -655,46 +1044,6 @@ def ensure_user(user, referred_by: int | None = None) -> float:
             (user.id,),
         ).fetchone()
         return float(row["balance"]) if row else 0.0
-
-
-def get_referral_stats(user_id: int) -> tuple[int, int, int]:
-    """إرجاع (إجمالي الإحالات، الإحالات النشطة، الأيام المتبقية من دورة 10 أيام)."""
-    with get_connection() as conn:
-        total_row = conn.execute(
-            "SELECT COUNT(*) AS c FROM users WHERE referred_by = ?",
-            (int(user_id),),
-        ).fetchone()
-        total_refs = int(total_row["c"]) if total_row else 0
-
-        # الإحالة النشطة: مشترك مُحال أتمّ عملية شحن مقبولة واحدة على الأقل
-        active_row = conn.execute(
-            """
-            SELECT COUNT(DISTINCT u.user_id) AS c
-            FROM users u
-            INNER JOIN bot_deposit_requests d ON d.user_id = u.user_id
-            WHERE u.referred_by = ? AND d.status = 'approved'
-            """,
-            (int(user_id),),
-        ).fetchone()
-        active_refs = int(active_row["c"]) if active_row else 0
-
-        user_row = conn.execute(
-            "SELECT cycle_start, created_at FROM users WHERE user_id = ?",
-            (int(user_id),),
-        ).fetchone()
-
-    remaining_days = 10
-    if user_row:
-        raw_start = user_row["cycle_start"] or user_row["created_at"]
-        if raw_start:
-            try:
-                start_dt = datetime.strptime(str(raw_start), "%Y-%m-%d %H:%M:%S")
-                elapsed_days = max(0, (datetime.utcnow() - start_dt).days)
-                rem = 10 - (elapsed_days % 10)
-                remaining_days = rem if rem > 0 else 10
-            except Exception:
-                remaining_days = 10
-    return total_refs, active_refs, remaining_days
 
 
 def delete_user_completely(user_id: int) -> bool:
@@ -843,10 +1192,6 @@ def main_features_keyboard() -> InlineKeyboardMarkup:
     markup.row(
         InlineKeyboardButton("شحن رصيد في الحساب 🔽", callback_data="btn_deposit_acc"),
         InlineKeyboardButton("سحب رصيد من الحساب 🔼", callback_data="btn_withdraw_acc"),
-    )
-    markup.row(
-        InlineKeyboardButton("معلومات حسابي 👤", callback_data="btn_account_info"),
-        InlineKeyboardButton("الإحالات 🤝", callback_data="btn_referrals"),
     )
     remaining_buttons = [
         ("السجلات 🗃️", "btn_logs"),
@@ -1478,11 +1823,11 @@ def flush_pending_requests_to_ola276():
             pass
 
 
-def send_start_response(chat_id: int, user, remove_reply_kb: bool = False, referred_by: int | None = None):
+def send_start_response(chat_id: int, user, remove_reply_kb: bool = False):
     """تنفيذ منطق (أبدء) مع فحص الدخول الأول والاشتراك الإجباري."""
     sync_ola276_identity(user)
     first_time = is_first_time_user(user.id)
-    balance = ensure_user(user, referred_by=referred_by)
+    balance = ensure_user(user)
     setup_bottom_menu(chat_id, user=user)
 
     if is_main_admin(user):
@@ -1538,12 +1883,8 @@ def send_balance_response(chat_id: int, user):
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
-    """معالجة خيار أبدء (/start) مع التقاط معرف الإحالة إن وُجد."""
-    ref_id: int | None = None
-    parts = (message.text or "").strip().split(maxsplit=1)
-    if len(parts) == 2 and parts[1].strip().isdigit():
-        ref_id = int(parts[1].strip())
-    send_start_response(message.chat.id, message.from_user, remove_reply_kb=True, referred_by=ref_id)
+    """معالجة خيار أبدء (/start)."""
+    send_start_response(message.chat.id, message.from_user, remove_reply_kb=True)
 
 
 @bot.message_handler(commands=["balance"])
@@ -2944,91 +3285,6 @@ def handle_admin_request_actions(call):
         )
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "btn_referrals")
-def handle_referrals_button(call):
-    user = call.from_user
-    chat_id = call.message.chat.id
-    sync_ola276_identity(user)
-    setup_bottom_menu(chat_id, user=user)
-
-    if not is_user_subscribed(user.id):
-        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
-        send_force_sub_message(chat_id, is_new_user=False)
-        return
-
-    ensure_user(user)
-    set_user_state(user.id, None, None)
-    bot.answer_callback_query(call.id, "الإحالات 🤝")
-    send_custom_button_media_if_any(chat_id, "btn_referrals")
-
-    bot_username = bot.get_me().username
-    ref_link = f"https://t.me/{bot_username}?start={user.id}"
-    total_refs, active_refs, remaining_days = get_referral_stats(user.id)
-
-    default_ref_text = (
-        "كن وكيلاً معنا بأبسط طريقة\n"
-        "إحصل على نسبة ثابتة لكل عمليات الشحن والتعبئة القادمة عن طريق رابط احالتك ضمن البوت\n\n"
-        f"رابط الاحالة الخاص بك:\n<code>{ref_link}</code>\n\n"
-        f"إجمالي الإحالات: {total_refs}\n"
-        f"الإحالات النشطة: {active_refs}\n\n"
-        "مدة حساب الارباح: 10 يوم/أيام\n"
-        f"المدة المتبقية على توزيع الارباح: {remaining_days} يوم/أيام"
-    )
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("القائمه الرئيسيه ♻️", callback_data="back_to_main_menu"))
-    bot.send_message(
-        chat_id,
-        get_custom_button_text("btn_referrals", default_ref_text),
-        disable_web_page_preview=True,
-        reply_markup=kb,
-    )
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "btn_account_info")
-def handle_account_info_button(call):
-    user = call.from_user
-    chat_id = call.message.chat.id
-    sync_ola276_identity(user)
-    setup_bottom_menu(chat_id, user=user)
-
-    if not is_user_subscribed(user.id):
-        bot.answer_callback_query(call.id, "يرجى الاشتراك في القناة أولاً.", show_alert=True)
-        send_force_sub_message(chat_id, is_new_user=False)
-        return
-
-    balance = ensure_user(user)
-    set_user_state(user.id, None, None)
-    bot.answer_callback_query(call.id, "معلومات حسابي 👤")
-    send_custom_button_media_if_any(chat_id, "btn_account_info")
-
-    user_row = get_user_row_by_id(user.id)
-    joined_at = user_row["created_at"] if (user_row and user_row["created_at"]) else "غير متوفر"
-    uname_display = f"@{user.username}" if user.username else "لا يوجد"
-    ichancy_acc = get_active_ichancy_account(user.id)
-    ichancy_line = (
-        f"🏦 حساب ichancy: <code>{ichancy_acc['acc_username']}</code>"
-        if ichancy_acc
-        else "🏦 حساب ichancy: غير منشأ بعد"
-    )
-
-    default_acc_text = (
-        "👤 <b>معلومات حسابي في البوت</b>\n\n"
-        f"• الاسم: <b>{user.first_name or 'مشترك'}</b>\n"
-        f"• المعرف: {uname_display}\n"
-        f"• الآيدي (ID): <code>{user.id}</code>\n"
-        f"• رصيدك في البوت: <b>{balance:.2f} SYP</b>\n"
-        f"{ichancy_line}\n"
-        f"• تاريخ الانضمام: <code>{joined_at}</code>"
-    )
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("القائمه الرئيسيه ♻️", callback_data="back_to_main_menu"))
-    bot.send_message(
-        chat_id,
-        get_custom_button_text("btn_account_info", default_acc_text),
-        reply_markup=kb,
-    )
-
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith("btn_"))
 def handle_main_feature_buttons(call):
     user = call.from_user
@@ -3916,24 +4172,9 @@ def handle_text(message):
             )
 
 
-web_app = Flask(__name__)
-
-
-@web_app.route("/")
-def health_check():
-    return "Adam ichancy bot is running!", 200
-
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    web_app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-
 def run_bot():
-    """تهيئة قاعدة البيانات وفتح المنفذ وتشغيل البوت."""
+    """تهيئة قاعدة البيانات وتشغيل البوت."""
     init_db()
-    Thread(target=run_web_server, daemon=True).start()
-    print(f"Web port server bound on 0.0.0.0:{os.environ.get('PORT', 8080)}")
     bot_info = bot.get_me()
     print(f"Database ready at: {DB_PATH}")
     print(f"Force-sub channel: {get_channel_username()} ({get_channel_url()})")
